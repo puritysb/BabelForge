@@ -507,10 +507,28 @@ def translate_book(title: str, author: str, chapters: list[Chapter],
 
     def _commit_batch(ci: int, i: int, window: list[str], ko: list[str]) -> None:
         """Write a completed batch's translations into chapter_pairs and flush
-        the checkpoint periodically. Mutates done_batches / last_ckpt."""
+        the checkpoint periodically. Mutates done_batches / last_ckpt.
+
+        A window can mix already-translated paragraphs with blank ones (it's
+        re-queued whenever ANY slot is blank, and window boundaries can shift
+        between runs — e.g. after a batching-strategy change). If the whole
+        batch then fails (retries exhausted), naively overwriting every slot
+        with "" would wipe out paragraphs that were already translated in a
+        prior run/checkpoint. Never regress a non-blank slot to blank.
+        """
         nonlocal done_batches, last_ckpt
+        regressions = 0
         for j, tr in enumerate(ko):
-            chapter_pairs[ci][i + j][1] = tr
+            idx = i + j
+            if not tr.strip() and chapter_pairs[ci][idx][1].strip():
+                regressions += 1
+                continue
+            chapter_pairs[ci][idx][1] = tr
+        if regressions:
+            sys.stderr.write(
+                f"[translate] ch{ci}@{i}: kept {regressions} pre-existing "
+                f"translation(s) instead of blanking them\n"
+            )
         done_batches += 1
         if done_batches % 20 == 0:
             sys.stderr.write(
