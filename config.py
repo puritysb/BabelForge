@@ -73,7 +73,11 @@ TRANSLATE_BATCH_PARAGRAPHS = 20                          # max paragraphs per GL
 # Packing to a char budget keeps output well under the ceiling and improves
 # throughput. Small paragraphs still batch up to TRANSLATE_BATCH_PARAGRAPHS.
 TRANSLATE_BATCH_MAX_CHARS = 2200
-TRANSLATE_MAX_RETRIES = 4
+# 4 retries (backoff 1/2/4/8s = 15s total) wasn't enough headroom during the
+# Nietzsche run — 17 batches exhausted all 4 and still hit 429. Raised so
+# backoff has real room to clear a sustained rate-limit window; this is a
+# background job, so latency matters far less than not giving up early.
+TRANSLATE_MAX_RETRIES = 6
 TRANSLATE_TIMEOUT_S = 240
 TRANSLATE_WORKERS = 2  # concurrent GLM calls (each ~20s on the coding plan;
                        # reduced from 8 due to GLM 429 rate limiting)
