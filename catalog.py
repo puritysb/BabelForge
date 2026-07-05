@@ -84,8 +84,12 @@ def mark_failed(req_id: str, error: str) -> None:
 
 
 def mark_published(req_id: str, epub_path: str, opds_url: str) -> None:
+    # Clear a stale `error` from an earlier failed attempt on this same
+    # req_id (e.g. a resumed request) — otherwise a published record keeps
+    # showing the old failure message forever, which is what get_status()
+    # (CLI and the babelforge MCP tool) hands straight to callers.
     update(req_id, status="published", epub_path=epub_path, opds_url=opds_url,
-           progress={"done": 100, "total": 100, "pct": 100.0})
+           progress={"done": 100, "total": 100, "pct": 100.0}, error=None)
 
 
 def get(req_id: str) -> Optional[dict]:
