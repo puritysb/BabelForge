@@ -107,7 +107,8 @@ def web_search(query: str, count: int = 5,
 
     Fails soft: returns [] if the key is missing, the endpoint errors, or the
     payload can't be parsed. `query` is truncated to ~70 chars (the tool's
-    recommendation) by the caller if needed.
+    recommendation) by the caller if needed. `count` caps the results returned
+    (the tool has no count arg — it returns a fixed set, so we slice here).
     """
     key = _api_key()
     if not key or not query.strip():
@@ -116,7 +117,7 @@ def web_search(query: str, count: int = 5,
     try:
         client = _StreamableHttpMcp(config.ZAI_MCP_WEB_SEARCH_URL, key, timeout)
         result = client.call_tool("web_search_prime",
-                                  {"search_query": query, "count": count})
+                                  {"search_query": query})
     except Exception as e:  # network, HTTP, protocol — never propagate
         sys.stderr.write(f"[mcp_client] web_search failed: {e}\n")
         return []
@@ -137,7 +138,7 @@ def web_search(query: str, count: int = 5,
                 "link": item.get("link", ""),
                 "content": item.get("content", ""),
             })
-    return out
+    return out[:count]
 
 
 if __name__ == "__main__":  # quick manual probe: python mcp_client.py "<query>"
