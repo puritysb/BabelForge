@@ -210,14 +210,29 @@ def _proofread_batch(originals: list[str], translations: list[str], source_lang:
         glossary_txt = "\n".join(rules)
         system_prompt += f"\n\nGlossary (ensure these are applied):\n{glossary_txt}"
 
+    # Stash HTML tags before the proofreading pass too — this second pass
+    # rewrites the Korean, so raw <i>/<b>/… would be just as vulnerable to
+    # mangling here as in the draft pass. Placeholders keep them intact; we
+    # restore once on the polished output using the original+draft tag maps.
+    stashed_orig, maps_o = [], []
+    for orig in originals:
+        s, m = _stash_tags(orig)
+        stashed_orig.append(s)
+        maps_o.append(m)
+    stashed_trans, maps_t = [], []
+    for trans in translations:
+        s, m = _stash_tags(trans)
+        stashed_trans.append(s)
+        maps_t.append(m)
+
     # Pair them up in the user prompt so the model can easily inspect
     paired = []
-    for idx, (orig, trans) in enumerate(zip(originals, translations), 1):
+    for idx, (orig, trans) in enumerate(zip(stashed_orig, stashed_trans), 1):
         paired.append(f"[{idx}] Original:\n{orig}\n[{idx}] Draft Translation:\n{trans}")
-    
+
     user_msg = (
         f"Please proofread these {n} draft translation(s) against the originals.\n"
-        f"Output exactly {n} corrected paragraphs separated by {PARA_DELIM}.\n\n" + 
+        f"Output exactly {n} corrected paragraphs separated by {PARA_DELIM}.\n\n" +
         "\n\n".join(paired)
     )
 
@@ -230,13 +245,19 @@ def _proofread_batch(originals: list[str], translations: list[str], source_lang:
         parts = [re.sub(r"^\[\d+\]\s*", "", p) if p else p for p in parts]
         parts = [p for p in parts if p is not None]
         if len(parts) == n:
+            # Restore tags. Merge each paragraph's original + draft maps so any
+            # placeholder the proofreader emits (from either side) resolves.
+            restored = [
+                _restore_tags(p, {**maps_o[i], **maps_t[i]})
+                for i, p in enumerate(parts)
+            ]
             sys.stderr.write(f"[translate] 2-Pass Proofread succeeded for batch of {n}\n")
-            return parts
+            return restored
         else:
             sys.stderr.write(f"[translate] 2-Pass Proofread returned mismatch ({len(parts)}/{n}). Using draft.\n")
     except Exception as e:
         sys.stderr.write(f"[translate] 2-Pass Proofread failed ({e}). Using draft.\n")
-    
+
     return translations
 
 

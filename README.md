@@ -56,3 +56,39 @@ cp .env.example .env   # then fill ZAI_API_KEY
 > need `activate` or the console scripts, recreate the venv from `requirements.txt`.
 
 `venv/`, `.env`, `data/`, `logs/`, and `__pycache__/` are gitignored.
+
+## Usage
+
+The flow is two steps: **search** for a book, then **translate** the candidate you pick.
+
+```bash
+# 1. Search — prints candidates as JSONL, one book per line.
+./venv/bin/python3 search.py "pride and prejudice" --no-line
+./venv/bin/python3 search.py "annas: dostoevsky" --no-line   # opt-in Anna's Archive
+
+# 2. Save the ONE candidate line you want to a file, then run the pipeline.
+#    start.sh runs it detached (returns immediately; log under logs/).
+echo '<paste the chosen candidate JSON line here>' > candidate.json
+export ZAI_API_KEY=<your GLM Coding Plan key>   # or put GLM_API_KEY=... in .env
+./start.sh candidate.json
+
+#    …or run in the foreground (blocks until done, streams logs to the terminal):
+./run_request.sh candidate.json
+```
+
+The pipeline runs fetch → extract → auto-glossary → translate → assemble → publish → device push,
+updating `data/catalog.json` at each step. A novel takes ~1–2h (8 concurrent GLM workers);
+translation is checkpointed, so a killed run resumes where it left off on rerun.
+
+```bash
+# Progress: last few requests and their status.
+./venv/bin/python3 -c "import catalog; print(catalog.recent(5))"
+
+# Live log of the most recent detached run.
+tail -f logs/pipeline.*.log
+```
+
+On success the bilingual EPUB is added to Calibre and served at the OPDS feed
+(`books.getlingo.store/opds`); the reader can also pull it, or it is pushed to the device
+directly if reachable. The full agent runbook lives in
+`.agents/skills/book-translator/SKILL.md`.
