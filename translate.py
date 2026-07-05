@@ -154,6 +154,47 @@ def _chat(messages: list[dict], timeout: int = config.TRANSLATE_TIMEOUT_S) -> st
     raise TranslationError(f"exhausted retries: {last_err}")
 
 
+# Match a "[k] text..." block: the number at line start, then everything up to
+# the next "[k]" line. GLM keeps an explicit numbered list far more reliably
+# than a lone ⟦P⟧ delimiter, so this is the primary alignment signal.
+_NUM_MARKER_RE = re.compile(
+    r'(?m)^[ \t]*\[(\d+)\][ \t]*(.*(?:\n(?!\s*\[\d+\][ \t]*).*)*)')
+
+
+def _parse_numbered_slots(raw: str, n: int) -> list[str]:
+    """Split a batch response into exactly n slots ('' for any not recovered).
+
+    Primary signal is the [k] markers the model was told to keep; falls back to
+    a PARA_DELIM split only when no usable markers are present. A lone marker on
+    a multi-paragraph batch means the model collapsed everything into one blob,
+    so we discard it and let the caller re-translate each paragraph. Slots hold
+    the model's raw text (tag placeholders intact) — the caller restores tags.
+    """
+    slots = [""] * n
+    got = 0
+    for m in _NUM_MARKER_RE.finditer(raw):
+        idx = int(m.group(1)) - 1
+        if 0 <= idx < n and not slots[idx]:
+            text = m.group(2).strip().replace(PARA_DELIM, "").strip()
+            if text:
+                slots[idx] = text
+                got += 1
+    if got >= 2 or (got == 1 and n <= 3):
+        return slots
+    if got == 1:
+        # Collapsed into one blob under a single marker — treat as unaligned.
+        return [""] * n
+    # No markers at all — legacy positional split on the delimiter.
+    parts = [re.sub(r"^[ \t]*\[\d+\][ \t]*", "", p.strip())
+             for p in raw.split(PARA_DELIM) if p.strip()]
+    if len(parts) <= 1 and n > 1:
+        # One blob with neither markers nor delimiters → collapsed; re-translate.
+        return [""] * n
+    for i, p in enumerate(parts[:n]):
+        slots[i] = p
+    return slots
+
+
 def _translate_one(paragraph: str, source_lang: str = "en", glossary: dict | None = None) -> str:
     """Translate a single paragraph. Returns "" on failure (never raises).
 
@@ -195,10 +236,11 @@ def _proofread_batch(originals: list[str], translations: list[str], source_lang:
         "or unnatural Korean structures.\n\n"
         "Rules:\n"
         "1. Generate polished, natural literary Korean translations.\n"
-        f"2. Keep the exact paragraph count and order: emit exactly {n} Korean paragraphs, "
-        f"separated by the marker {PARA_DELIM} on its own line.\n"
+        f"2. Keep the exact paragraph count and order: output exactly {n} Korean "
+        f"paragraphs, each on its own line prefixed with its number in square "
+        f"brackets — [1], [2], … through [{n}]. Never merge, skip, or renumber.\n"
         "3. Maintain original formatting, punctuation, and style.\n"
-        f"4. Output ONLY the polished Korean paragraphs separated by {PARA_DELIM}. No comments, explanations, or note prefixes."
+        "4. Output ONLY the numbered polished Korean paragraphs. No comments or explanations."
     )
     if glossary:
         rules = []
@@ -232,8 +274,8 @@ def _proofread_batch(originals: list[str], translations: list[str], source_lang:
 
     user_msg = (
         f"Please proofread these {n} draft translation(s) against the originals.\n"
-        f"Output exactly {n} corrected paragraphs separated by {PARA_DELIM}.\n\n" +
-        "\n\n".join(paired)
+        f"Output exactly {n} corrected paragraphs, each prefixed with its [k] "
+        f"number.\n\n" + "\n\n".join(paired)
     )
 
     try:
@@ -241,20 +283,19 @@ def _proofread_batch(originals: list[str], translations: list[str], source_lang:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_msg}
         ])
-        parts = [p.strip() for p in raw.split(PARA_DELIM)]
-        parts = [re.sub(r"^\[\d+\]\s*", "", p) if p else p for p in parts]
-        parts = [p for p in parts if p is not None]
-        if len(parts) == n:
+        slots = _parse_numbered_slots(raw, n)
+        if all(s.strip() for s in slots):
             # Restore tags. Merge each paragraph's original + draft maps so any
             # placeholder the proofreader emits (from either side) resolves.
             restored = [
-                _restore_tags(p, {**maps_o[i], **maps_t[i]})
-                for i, p in enumerate(parts)
+                _restore_tags(s, {**maps_o[i], **maps_t[i]})
+                for i, s in enumerate(slots)
             ]
             sys.stderr.write(f"[translate] 2-Pass Proofread succeeded for batch of {n}\n")
             return restored
         else:
-            sys.stderr.write(f"[translate] 2-Pass Proofread returned mismatch ({len(parts)}/{n}). Using draft.\n")
+            filled = sum(1 for s in slots if s.strip())
+            sys.stderr.write(f"[translate] 2-Pass Proofread returned mismatch ({filled}/{n}). Using draft.\n")
     except Exception as e:
         sys.stderr.write(f"[translate] 2-Pass Proofread failed ({e}). Using draft.\n")
 
@@ -306,58 +347,40 @@ def _translate_batch(paragraphs: list[str], source_lang: str = "en",
 
     user_msg = (
         f"Translate the following {n} {source_lang} paragraph(s) into Korean. "
-        f"Emit exactly {n} Korean paragraphs separated by {PARA_DELIM} on its "
-        f"own line. Match input order.{context_block}\n\n{numbered}"
+        f"Output each Korean paragraph on its own line, prefixed with its number "
+        f"in square brackets exactly as in the input — [1], [2], … through "
+        f"[{n}]. Keep all {n} numbers, one per source paragraph, in order; "
+        f"never merge, skip, or renumber."
+        f"{context_block}\n\n{numbered}"
     )
     raw = _chat([
         {"role": "system", "content": _system_prompt(source_lang, glossary)},
         {"role": "user", "content": user_msg},
     ])
-    parts = [p.strip() for p in raw.split(PARA_DELIM)]
-    # Strip any leading numbering the model echoed back ("[1] ...").
-    parts = [re.sub(r"^\[\d+\]\s*", "", p) if p else p for p in parts]
-    parts = [p for p in parts if p is not None]
-    # Restore HTML tags in each translated paragraph
-    parts = [_restore_tags(p, stashed_maps[i]) if i < len(stashed_maps) else p
-             for i, p in enumerate(parts)]
-    
-    # Apply 2-Pass Proofreading if enabled and draft is aligned
-    if len(parts) == n:
-        if config.TWO_PASS_TRANSLATION:
-            return _proofread_batch(paragraphs, parts, source_lang, glossary)
-        return parts
+    # Align by the [k] markers (robust to a dropped ⟦P⟧). Slots hold raw model
+    # text with tag placeholders still in; restore tags on whatever came back.
+    slots = _parse_numbered_slots(raw, n)
+    for i in range(n):
+        if slots[i]:
+            slots[i] = _restore_tags(slots[i], stashed_maps[i])
 
-    # Severe shortfall (≤ half) → single-paragraph fallback for the missing
-    # slots. Realignment can't be trusted when the model dropped most of them.
-    if len(parts) < max(1, n // 2):
+    # Fill exactly the slots the batch didn't produce with single-paragraph
+    # calls (rarely dropped — no alignment ambiguity). Handles non-contiguous
+    # holes, so a partial batch keeps its good paragraphs instead of re-doing
+    # the whole thing.
+    missing = [i for i in range(n) if not slots[i].strip()]
+    if missing:
         sys.stderr.write(
-            f"[translate] batch returned {len(parts)}/{n}; falling back to "
-            f"single-paragraph translation\n"
+            f"[translate] batch recovered {n - len(missing)}/{n}; "
+            f"filling {len(missing)} slot(s) individually\n"
         )
-        # Use whatever the batch did return for the first len(parts) slots
-        # (best-effort), then call one-by-one for the rest.
-        result = list(parts) + [""] * (n - len(parts))
-        for i in range(len(parts), n):
-            result[i] = _translate_one(paragraphs[i], source_lang=source_lang, glossary=glossary)
-        return result
+        for i in missing:
+            slots[i] = _translate_one(paragraphs[i], source_lang=source_lang,
+                                      glossary=glossary)
 
-    # Mild over/undershoot — realign as before.
-    if len(parts) > n:
-        head = parts[:n-1]
-        head.append("\n\n".join(parts[n-1:]))
-        # Optional proofread on realigned parts
-        if config.TWO_PASS_TRANSLATION:
-            return _proofread_batch(paragraphs, head, source_lang, glossary)
-        return head
-    # Under-shoot within tolerance — pad. assemble.py drops empty translations,
-    # so the cp-original still shows (English visible to the reader).
-    sys.stderr.write(
-        f"[translate] expected {n}, got {len(parts)} — padding\n"
-    )
-    padded = parts + [""] * (n - len(parts))
     if config.TWO_PASS_TRANSLATION:
-        return _proofread_batch(paragraphs, padded, source_lang, glossary)
-    return padded
+        return _proofread_batch(paragraphs, slots, source_lang, glossary)
+    return slots
 
 
 

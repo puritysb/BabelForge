@@ -112,7 +112,7 @@ def build_glossary_from_text(text: str, source_lang: str = "en",
     # enrich_glossary_with_llm; an unenriched glossary still enforces
     # consistency, just without a fixed target string.
     glossary: dict[str, str] = {}
-    for term, count in sorted_terms[:50]:  # cap at 50 terms
+    for term, count in sorted_terms[:30]:  # cap — keep the highest-value terms
         glossary[term] = f"<CONSISTENT:{term}>"
 
     return glossary
@@ -134,49 +134,85 @@ def build_glossary_from_chapters(chapters: list, source_lang: str = "en") -> dic
 _SRC_NAME = {"en": "English", "ja": "Japanese", "fr": "French",
              "de": "German", "zh": "Chinese", "es": "Spanish"}
 
+# Terms per LLM extraction call. A single 50-term request tended to return
+# truncated/malformed JSON (observed: parse error mid-array); smaller chunks
+# parse reliably and a bad chunk only loses its own terms, not the whole book.
+_ENRICH_CHUNK = 20
+
+
+def _lenient_json(raw: str):
+    """Parse a JSON object from an LLM reply, tolerating ```-fences and trailing
+    prose. Returns a dict, or None if nothing parseable is found."""
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r'^```(?:json)?\s*', '', raw)
+        raw = re.sub(r'\s*```$', '', raw)
+    try:
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else None
+    except json.JSONDecodeError:
+        pass
+    # Recover the outermost { ... } if the model wrapped it in extra text.
+    i, j = raw.find("{"), raw.rfind("}")
+    if 0 <= i < j:
+        try:
+            obj = json.loads(raw[i:j + 1])
+            return obj if isinstance(obj, dict) else None
+        except json.JSONDecodeError:
+            pass
+    return None
+
 
 def _llm_extract_korean(terms: list[str], source_lang: str, _chat_fn,
                         grounding: list[str] | None = None) -> dict[str, str]:
     """Ask the LLM for each term's Korean rendering, returning {term: 번역} for
     the terms it answered. When `grounding` (web-search snippets) is provided,
     the model is told to prefer the rendering that actually appears there —
-    published usage — rather than inventing one. Returns {} on any failure.
+    published usage — rather than inventing one. Runs in chunks so a single
+    oversized/malformed reply can't wipe the whole glossary. Returns {} if every
+    chunk fails.
     """
     src_name = _SRC_NAME.get(source_lang, source_lang)
-    terms_text = "\n".join(f"{i+1}. {t}" for i, t in enumerate(terms))
+    context = ("\n".join(grounding)) if grounding else ""
+    out: dict[str, str] = {}
 
-    if grounding:
-        system = (
-            f"You are an expert {src_name}-to-Korean literary translator. For each "
-            "term, give the single Korean rendering used in published Korean "
-            "editions. Prefer a rendering that appears in the Search Context below; "
-            "only if a term is absent there, fall back to the most natural "
-            "published transliteration. Respond ONLY as JSON: {\"term\": \"번역\"}"
-        )
-        context = "\n".join(grounding)
-        user = (f"Search Context (real web results):\n{context}\n\n"
-                f"Give the Korean rendering for each term:\n{terms_text}")
-    else:
-        system = (
-            f"You are an expert {src_name}-to-Korean literary translator. "
-            "For each term below, provide the single most natural Korean translation "
-            "used in published literature. Respond in JSON: {\"term\": \"번역\"}"
-        )
-        user = f"Translate these terms to Korean:\n{terms_text}"
+    for start in range(0, len(terms), _ENRICH_CHUNK):
+        chunk = terms[start:start + _ENRICH_CHUNK]
+        terms_text = "\n".join(f"{i+1}. {t}" for i, t in enumerate(chunk))
+        if grounding:
+            system = (
+                f"You are an expert {src_name}-to-Korean literary translator. For "
+                "each term, give the single Korean rendering used in published "
+                "Korean editions. Prefer a rendering that appears in the Search "
+                "Context below; only if a term is absent there, fall back to the "
+                "most natural published transliteration. Respond ONLY as JSON: "
+                "{\"term\": \"번역\"}"
+            )
+            user = (f"Search Context (real web results):\n{context}\n\n"
+                    f"Give the Korean rendering for each term:\n{terms_text}")
+        else:
+            system = (
+                f"You are an expert {src_name}-to-Korean literary translator. For "
+                "each term below, provide the single most natural Korean translation "
+                "used in published literature. Respond ONLY as JSON: {\"term\": \"번역\"}"
+            )
+            user = f"Translate these terms to Korean:\n{terms_text}"
 
-    try:
-        raw = _chat_fn([
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ]).strip()
-        if raw.startswith("```"):  # LLM may wrap in ```json fences
-            raw = re.sub(r'^```(?:json)?\s*', '', raw)
-            raw = re.sub(r'\s*```$', '', raw)
-        parsed = json.loads(raw)
-        return {t: parsed[t] for t in terms if t in parsed}
-    except Exception as e:
-        sys.stderr.write(f"[glossary_builder] LLM extraction failed: {e}\n")
-        return {}
+        try:
+            raw = _chat_fn([
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ])
+        except Exception as e:
+            sys.stderr.write(f"[glossary_builder] extraction chunk failed: {e}\n")
+            continue
+        parsed = _lenient_json(raw)
+        if parsed:
+            for t in chunk:
+                v = parsed.get(t)
+                if isinstance(v, str) and v.strip():
+                    out[t] = v
+    return out
 
 
 def enrich_glossary_with_llm(glossary: dict[str, str], source_lang: str = "en",
