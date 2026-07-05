@@ -15,7 +15,7 @@ is **relocatable** (no hardcoded absolute paths — keep it that way).
 ```
 request → search (Gutenberg / Standard Ebooks / Anna's / local)
         → fetch source → extract chapters (BeautifulSoup / ebooklib)
-        → auto-glossary (recurring names/terms → canonical Korean, GLM-enriched)
+        → auto-glossary (recurring names/terms → canonical Korean, web-search-grounded via Z.ai MCP)
         → GLM translation (paragraph-aligned, 20/batch, 8 workers, 2-pass draft+proofread,
                            HTML-tag preserving, glossary + preceding-source-context aware)
         → assemble bilingual EPUB (cp-original / cp-translation block-level <p> markers)
@@ -34,7 +34,8 @@ request → search (Gutenberg / Standard Ebooks / Anna's / local)
 | `sources/` | Source adapters (`gutenberg`, `standard_ebooks`, `annas_archive`, `local_file`), dispatched via `sources/__init__.py::get_adapter()`. |
 | `extract.py` | Chapter/paragraph extraction. |
 | `translate.py` | **GLM translation engine** — the biggest file. System prompt is **inline** (literary-translator, 1:1 paragraph alignment via `⟦P⟧` delimiter); batching, backoff, checkpoint resume, 2-pass. Also: **inline-HTML tag stashing** (`_stash_tags`/`_restore_tags` swap `<i>/<b>/<em>/…` for PUA placeholders so GLM can't mangle them), **glossary** enforcement in the system prompt, and **source-side context** (each batch gets the preceding 3 source paragraphs — parallel-safe, keeps tone/terminology steady across the 8 workers). |
-| `glossary_builder.py` | Auto-glossary — scans source chapters for recurring proper nouns/terms (`build_glossary_from_chapters`) and optionally asks GLM for their canonical Korean rendering (`enrich_glossary_with_llm`). `pipeline.py` runs it before translation and passes the result to `translate_book`; also usable as a standalone CLI writing `config.GLOSSARY_PATH`. |
+| `glossary_builder.py` | Auto-glossary — scans source chapters for recurring proper nouns/terms (`build_glossary_from_chapters`) and resolves their canonical Korean rendering. Default (`enrich_glossary_grounded`) **web-searches the top terms via the Z.ai MCP tool** (`mcp_client.py`) and grounds GLM's extraction in real published usage; `enrich_glossary_with_llm` is the offline fallback (plain guess). `pipeline.py` runs it before translation and passes the result to `translate_book`; also a standalone CLI (`--enrich`, `--no-web-search`) writing `config.GLOSSARY_PATH`. |
+| `mcp_client.py` | Minimal **self-contained MCP (Streamable-HTTP) client** — no Node dependency. Speaks initialize → notifications/initialized → tools/call over urllib against Z.ai MCP servers, authed with the Coding-Plan key. Exposes `web_search(query)`; fails soft (returns `[]`, never raises) so a search hiccup never blocks translation. |
 | `assemble.py` | Builds the bilingual EPUB. Emits **block-level `<p class="cp-original">` / `<p class="cp-translation">` only** — never `<span>` (firmware parser contract). |
 | `publish.py` | `calibredb add` into `~/Calibre-Library`. |
 | `device_push.py` | HTTP POST push to the reader (mDNS/subnet discovery). |
@@ -68,6 +69,7 @@ BabelForge is self-contained Python, but leans on four things outside it:
 | **`openclaw` CLI** (`/opt/homebrew/bin/openclaw`) | LINE notifications (`search.py`, `config.py:OPENCLAW_BIN`). | One `openclaw message send` subprocess call — no code dependency. |
 | **Calibre Content Server** (launchd `com.local.calibre-server`, port 8080; cloudflared `com.getlingo.openclaw.cloudflared`) | Hosts the OPDS feed at `books.getlingo.store/opds`. `publish.py` only calls `calibredb add`. | External service (KeepAlive launchd). |
 | **ZAI / GLM API** (`api.z.ai`, model `glm-5.2`) | Translation engine. Key from `.env` (`ZAI_API_KEY` or `GLM_API_KEY`) — **never hardcode**. | External API. |
+| **Z.ai MCP** (`api.z.ai/api/mcp/web_search_prime`, tool `web_search_prime`) | Grounds auto-glossary term renderings in published usage (`mcp_client.py`). Same Coding-Plan key; MCP is entitled on it independently of REST. | External MCP (Streamable HTTP). Optional — glossary degrades to an LLM guess if unreachable. |
 
 ## Conventions & gotchas
 

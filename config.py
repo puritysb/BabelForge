@@ -127,6 +127,17 @@ GLOSSARY_PATH = os.path.join(DATA_DIR, "glossary.json")  # Terminology glossary 
 # negligible and it clearly lifts terminology consistency, so default ON.
 GLOSSARY_ENABLED = True
 GLOSSARY_ENRICH = True
+# When GLOSSARY_WEB_SEARCH, enrichment first web-searches the top terms via the
+# Z.ai web_search_prime MCP tool (see mcp_client.py) and grounds GLM's Korean
+# renderings in real published usage instead of letting it guess — the whole
+# point of a glossary is the *established* rendering of a name/place. Bounded to
+# the GLOSSARY_WEB_SEARCH_TERMS most frequent terms to keep it to a few calls.
+GLOSSARY_WEB_SEARCH = True
+GLOSSARY_WEB_SEARCH_TERMS = 8
+
+# ─── Z.ai MCP (Streamable HTTP; same Coding-Plan key as the REST API) ───
+ZAI_MCP_WEB_SEARCH_URL = "https://api.z.ai/api/mcp/web_search_prime/mcp"
+ZAI_MCP_TIMEOUT_S = 60
 
 
 

@@ -105,16 +105,14 @@ def build_glossary_from_text(text: str, source_lang: str = "en",
         key=lambda x: (-x[1], x[0])
     )
 
-    # Build glossary — at this stage, we just flag terms for consistent
-    # translation. The translator prompt says "'term' must be translated
-    # as 'term'" which effectively means "keep consistent".
-    # A future enhancement could call web_search to find established translations.
+    # Build glossary — at this stage each term is flagged for *consistent*
+    # treatment with a <CONSISTENT:term> placeholder (the system prompt turns
+    # this into "always translate the same way"). The actual canonical Korean
+    # rendering is filled in later by enrich_glossary_grounded (web-search) or
+    # enrich_glossary_with_llm; an unenriched glossary still enforces
+    # consistency, just without a fixed target string.
     glossary: dict[str, str] = {}
     for term, count in sorted_terms[:50]:  # cap at 50 terms
-        # For now, we don't provide Korean translations — we just mark
-        # them for consistent treatment. The system prompt will say
-        # "'Term' must always be translated the same way throughout the book."
-        # If we have web_search available, we could look up translations.
         glossary[term] = f"<CONSISTENT:{term}>"
 
     return glossary
@@ -133,49 +131,107 @@ def build_glossary_from_chapters(chapters: list, source_lang: str = "en") -> dic
     return build_glossary_from_text(full_text, source_lang)
 
 
-def enrich_glossary_with_llm(glossary: dict[str, str], source_lang: str = "en",
-                              _chat_fn=None) -> dict[str, str]:
-    """Use an LLM call to suggest Korean translations for glossary terms.
+_SRC_NAME = {"en": "English", "ja": "Japanese", "fr": "French",
+             "de": "German", "zh": "Chinese", "es": "Spanish"}
 
-    _chat_fn: callable(messages: list[dict]) -> str  (inject translate._chat)
+
+def _llm_extract_korean(terms: list[str], source_lang: str, _chat_fn,
+                        grounding: list[str] | None = None) -> dict[str, str]:
+    """Ask the LLM for each term's Korean rendering, returning {term: 번역} for
+    the terms it answered. When `grounding` (web-search snippets) is provided,
+    the model is told to prefer the rendering that actually appears there —
+    published usage — rather than inventing one. Returns {} on any failure.
     """
-    if not _chat_fn or not glossary:
-        return glossary
-
-    terms = list(glossary.keys())
+    src_name = _SRC_NAME.get(source_lang, source_lang)
     terms_text = "\n".join(f"{i+1}. {t}" for i, t in enumerate(terms))
 
-    src_name = {"en": "English", "ja": "Japanese", "fr": "French",
-                "de": "German", "zh": "Chinese"}.get(source_lang, source_lang)
-
-    system = (
-        f"You are an expert {src_name}-to-Korean literary translator. "
-        "For each term below, provide the single most natural Korean translation "
-        "used in published literature. Respond in JSON: {\"term\": \"번역\"}"
-    )
-    user = f"Translate these terms to Korean:\n{terms_text}"
+    if grounding:
+        system = (
+            f"You are an expert {src_name}-to-Korean literary translator. For each "
+            "term, give the single Korean rendering used in published Korean "
+            "editions. Prefer a rendering that appears in the Search Context below; "
+            "only if a term is absent there, fall back to the most natural "
+            "published transliteration. Respond ONLY as JSON: {\"term\": \"번역\"}"
+        )
+        context = "\n".join(grounding)
+        user = (f"Search Context (real web results):\n{context}\n\n"
+                f"Give the Korean rendering for each term:\n{terms_text}")
+    else:
+        system = (
+            f"You are an expert {src_name}-to-Korean literary translator. "
+            "For each term below, provide the single most natural Korean translation "
+            "used in published literature. Respond in JSON: {\"term\": \"번역\"}"
+        )
+        user = f"Translate these terms to Korean:\n{terms_text}"
 
     try:
         raw = _chat_fn([
             {"role": "system", "content": system},
             {"role": "user", "content": user},
-        ])
-        # Try to parse as JSON (LLM may wrap in ```json blocks)
-        raw = raw.strip()
-        if raw.startswith("```"):
+        ]).strip()
+        if raw.startswith("```"):  # LLM may wrap in ```json fences
             raw = re.sub(r'^```(?:json)?\s*', '', raw)
             raw = re.sub(r'\s*```$', '', raw)
         parsed = json.loads(raw)
-        enriched = {}
-        for term in terms:
-            if term in parsed:
-                enriched[term] = parsed[term]
-            else:
-                enriched[term] = glossary[term]  # keep original
-        return enriched
+        return {t: parsed[t] for t in terms if t in parsed}
     except Exception as e:
-        sys.stderr.write(f"[glossary_builder] LLM enrichment failed: {e}\n")
+        sys.stderr.write(f"[glossary_builder] LLM extraction failed: {e}\n")
+        return {}
+
+
+def enrich_glossary_with_llm(glossary: dict[str, str], source_lang: str = "en",
+                              _chat_fn=None) -> dict[str, str]:
+    """Use one LLM call to suggest Korean translations for glossary terms.
+
+    _chat_fn: callable(messages: list[dict]) -> str  (inject translate._chat)
+    """
+    if not _chat_fn or not glossary:
         return glossary
+    terms = list(glossary.keys())
+    parsed = _llm_extract_korean(terms, source_lang, _chat_fn)
+    return {t: parsed.get(t, glossary[t]) for t in terms}
+
+
+def enrich_glossary_grounded(glossary: dict[str, str], source_lang: str = "en",
+                             title: str | None = None, _chat_fn=None,
+                             _search_fn=None, top_terms: int = 8) -> dict[str, str]:
+    """Web-search the most frequent glossary terms, then have the LLM extract
+    each term's canonical Korean rendering grounded in those snippets.
+
+    The glossary is frequency-ordered, so the first `top_terms` are the main
+    characters/places where a consistent, established rendering matters most.
+    Only those are searched (a handful of MCP calls); the LLM then renders ALL
+    terms, grounded where snippets exist. Falls back to the plain LLM guess if
+    no web results come back (offline / MCP unavailable), so this never blocks.
+
+    _chat_fn: translate._chat.  _search_fn: mcp_client.web_search (injectable
+    for tests).
+    """
+    if not _chat_fn or not glossary:
+        return glossary
+    if _search_fn is None:
+        from mcp_client import web_search as _search_fn
+
+    terms = list(glossary.keys())
+    snippets: list[str] = []
+    for term in terms[:top_terms]:
+        query = (f"{term} {title} 한국어 번역" if title
+                 else f"{term} 한국어 번역")[:70]
+        for r in (_search_fn(query, count=3) or [])[:3]:
+            txt = f"{r.get('title', '')} {r.get('content', '')}".strip()
+            if txt:
+                snippets.append(f"[{term}] {txt}")
+
+    if not snippets:
+        sys.stderr.write("[glossary_builder] no web grounding; LLM-only enrich\n")
+        return enrich_glossary_with_llm(glossary, source_lang, _chat_fn)
+
+    sys.stderr.write(
+        f"[glossary_builder] grounded enrich: {len(snippets)} snippets for "
+        f"{min(top_terms, len(terms))}/{len(terms)} terms\n"
+    )
+    parsed = _llm_extract_korean(terms, source_lang, _chat_fn, grounding=snippets)
+    return {t: parsed.get(t, glossary[t]) for t in terms}
 
 
 def main():
@@ -187,6 +243,8 @@ def main():
                         help="Source language code (en, ja, fr, ...)")
     parser.add_argument("--enrich", action="store_true",
                         help="Use LLM to suggest Korean translations")
+    parser.add_argument("--no-web-search", action="store_true",
+                        help="With --enrich, skip web-search grounding (LLM guess only)")
     args = parser.parse_args()
 
     # Extract text from source
@@ -208,8 +266,12 @@ def main():
         sys.path.insert(0, os.path.dirname(__file__))
         try:
             import translate
-            glossary = enrich_glossary_with_llm(glossary, args.source_lang,
-                                                _chat_fn=translate._chat)
+            if args.no_web_search:
+                glossary = enrich_glossary_with_llm(glossary, args.source_lang,
+                                                    _chat_fn=translate._chat)
+            else:
+                glossary = enrich_glossary_grounded(glossary, args.source_lang,
+                                                    _chat_fn=translate._chat)
         except ImportError:
             sys.stderr.write("[glossary_builder] translate.py not found, skipping enrichment\n")
 

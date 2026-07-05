@@ -11,7 +11,8 @@ tracked in OpenClaw's git history — this repo's history starts fresh.
 ```
 request → search (Gutenberg / Standard Ebooks / Anna's / local)
         → fetch → extract chapters (BeautifulSoup)
-        → build auto-glossary (recurring names/terms → canonical Korean)
+        → build auto-glossary (recurring names/terms → canonical Korean,
+                               web-search-grounded via Z.ai MCP)
         → GLM translation (paragraph-aligned, batched, 2-pass draft+proofread,
                             HTML-tag preserving, glossary + source-context aware)
         → assemble bilingual EPUB (cp-original / cp-translation markers)

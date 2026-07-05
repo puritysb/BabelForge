@@ -57,12 +57,22 @@ def run(candidate: dict, req_id: str | None = None,
         if config.GLOSSARY_ENABLED:
             try:
                 from glossary_builder import (build_glossary_from_chapters,
-                                              enrich_glossary_with_llm)
+                                              enrich_glossary_with_llm,
+                                              enrich_glossary_grounded)
                 glossary = build_glossary_from_chapters(chapters, source_lang)
                 if glossary and config.GLOSSARY_ENRICH:
                     import translate as _translate
-                    glossary = enrich_glossary_with_llm(
-                        glossary, source_lang, _chat_fn=_translate._chat)
+                    if config.GLOSSARY_WEB_SEARCH:
+                        # Ground name/place renderings in real published usage
+                        # via the Z.ai web_search_prime MCP tool; falls back to
+                        # a plain LLM guess if no web results come back.
+                        glossary = enrich_glossary_grounded(
+                            glossary, source_lang, title=cand.title,
+                            _chat_fn=_translate._chat,
+                            top_terms=config.GLOSSARY_WEB_SEARCH_TERMS)
+                    else:
+                        glossary = enrich_glossary_with_llm(
+                            glossary, source_lang, _chat_fn=_translate._chat)
                 if glossary:
                     os.makedirs(os.path.dirname(config.GLOSSARY_PATH), exist_ok=True)
                     with open(config.GLOSSARY_PATH, "w", encoding="utf-8") as f:
