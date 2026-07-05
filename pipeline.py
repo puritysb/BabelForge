@@ -49,6 +49,34 @@ def run(candidate: dict, req_id: str | None = None,
         source_lang = (cand.language or "en").split("-")[0].lower()
         checkpoint_path = os.path.join(config.CHECKPOINT_DIR, f"{req_id}.json")
 
+        # 3a. auto-glossary: extract recurring proper nouns/terms and (best-
+        # effort) look up their canonical Korean rendering, so every one of the
+        # concurrent workers translates a name/place the same way. Persisted to
+        # config.GLOSSARY_PATH for debug visibility, then passed explicitly.
+        glossary = None
+        if config.GLOSSARY_ENABLED:
+            try:
+                from glossary_builder import (build_glossary_from_chapters,
+                                              enrich_glossary_with_llm)
+                glossary = build_glossary_from_chapters(chapters, source_lang)
+                if glossary and config.GLOSSARY_ENRICH:
+                    import translate as _translate
+                    glossary = enrich_glossary_with_llm(
+                        glossary, source_lang, _chat_fn=_translate._chat)
+                if glossary:
+                    os.makedirs(os.path.dirname(config.GLOSSARY_PATH), exist_ok=True)
+                    with open(config.GLOSSARY_PATH, "w", encoding="utf-8") as f:
+                        json.dump(glossary, f, ensure_ascii=False, indent=2)
+                    sys.stderr.write(
+                        f"[pipeline] built glossary: {len(glossary)} terms "
+                        f"(enrich={config.GLOSSARY_ENRICH})\n"
+                    )
+            except Exception as e:
+                # Glossary is a quality boost, never a hard dependency — a
+                # failure here must not sink the whole translation.
+                sys.stderr.write(f"[pipeline] glossary build skipped: {e}\n")
+                glossary = None
+
         def progress_cb(done, total):
             catalog.set_progress(req_id, done, total)
             # Stream progress to LINE at ~20% intervals so the user isn't
@@ -70,6 +98,7 @@ def run(candidate: dict, req_id: str | None = None,
             chapters=chapters, progress_cb=progress_cb,
             source_lang=source_lang,
             checkpoint_path=checkpoint_path,
+            glossary=glossary,
         )
 
         # 4. assemble

@@ -15,7 +15,9 @@ is **relocatable** (no hardcoded absolute paths — keep it that way).
 ```
 request → search (Gutenberg / Standard Ebooks / Anna's / local)
         → fetch source → extract chapters (BeautifulSoup / ebooklib)
-        → GLM translation (paragraph-aligned, 20/batch, 8 workers, 2-pass draft+proofread)
+        → auto-glossary (recurring names/terms → canonical Korean, GLM-enriched)
+        → GLM translation (paragraph-aligned, 20/batch, 8 workers, 2-pass draft+proofread,
+                           HTML-tag preserving, glossary + preceding-source-context aware)
         → assemble bilingual EPUB (cp-original / cp-translation block-level <p> markers)
         → publish: calibredb add → Calibre Content Server OPDS feed
         → best-effort HTTP push to the XTeink reader (skipped silently if unreachable)
@@ -31,7 +33,8 @@ request → search (Gutenberg / Standard Ebooks / Anna's / local)
 | `search.py` | Catalog search → JSONL candidates; `openclaw message send` LINE notify. |
 | `sources/` | Source adapters (`gutenberg`, `standard_ebooks`, `annas_archive`, `local_file`), dispatched via `sources/__init__.py::get_adapter()`. |
 | `extract.py` | Chapter/paragraph extraction. |
-| `translate.py` | **GLM translation engine** — the biggest file. System prompt is **inline** (literary-translator, 1:1 paragraph alignment via `⟦P⟧` delimiter); batching, backoff, checkpoint resume, 2-pass. |
+| `translate.py` | **GLM translation engine** — the biggest file. System prompt is **inline** (literary-translator, 1:1 paragraph alignment via `⟦P⟧` delimiter); batching, backoff, checkpoint resume, 2-pass. Also: **inline-HTML tag stashing** (`_stash_tags`/`_restore_tags` swap `<i>/<b>/<em>/…` for PUA placeholders so GLM can't mangle them), **glossary** enforcement in the system prompt, and **source-side context** (each batch gets the preceding 3 source paragraphs — parallel-safe, keeps tone/terminology steady across the 8 workers). |
+| `glossary_builder.py` | Auto-glossary — scans source chapters for recurring proper nouns/terms (`build_glossary_from_chapters`) and optionally asks GLM for their canonical Korean rendering (`enrich_glossary_with_llm`). `pipeline.py` runs it before translation and passes the result to `translate_book`; also usable as a standalone CLI writing `config.GLOSSARY_PATH`. |
 | `assemble.py` | Builds the bilingual EPUB. Emits **block-level `<p class="cp-original">` / `<p class="cp-translation">` only** — never `<span>` (firmware parser contract). |
 | `publish.py` | `calibredb add` into `~/Calibre-Library`. |
 | `device_push.py` | HTTP POST push to the reader (mDNS/subnet discovery). |

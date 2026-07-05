@@ -11,7 +11,9 @@ tracked in OpenClaw's git history — this repo's history starts fresh.
 ```
 request → search (Gutenberg / Standard Ebooks / Anna's / local)
         → fetch → extract chapters (BeautifulSoup)
-        → GLM translation (paragraph-aligned, batched, 2-pass draft+proofread)
+        → build auto-glossary (recurring names/terms → canonical Korean)
+        → GLM translation (paragraph-aligned, batched, 2-pass draft+proofread,
+                            HTML-tag preserving, glossary + source-context aware)
         → assemble bilingual EPUB (cp-original / cp-translation markers)
         → publish: calibredb add → Calibre Content Server OPDS feed
         → best-effort HTTP push to the XTeink e-ink reader

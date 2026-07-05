@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -94,7 +95,11 @@ def _system_prompt(source_lang: str, glossary: dict | None = None) -> str:
     if glossary:
         rules = []
         for src_word, tgt_word in glossary.items():
-            rules.append(f"- '{src_word}' must be translated as '{tgt_word}'")
+            # Handle auto-glossary placeholders like <CONSISTENT:Term>
+            if isinstance(tgt_word, str) and tgt_word.startswith("<CONSISTENT:"):
+                rules.append(f"- '{src_word}' must always be translated the same way throughout the book (use the most natural Korean rendering and keep it consistent)")
+            else:
+                rules.append(f"- '{src_word}' must be translated as '{tgt_word}'")
         glossary_txt = "\n".join(rules)
         prompt += f"\n\nTerminology Glossary (strictly respect these mappings):\n{glossary_txt}"
     return prompt
@@ -198,7 +203,10 @@ def _proofread_batch(originals: list[str], translations: list[str], source_lang:
     if glossary:
         rules = []
         for src_word, tgt_word in glossary.items():
-            rules.append(f"- '{src_word}' must be translated as '{tgt_word}'")
+            if isinstance(tgt_word, str) and tgt_word.startswith("<CONSISTENT:"):
+                rules.append(f"- '{src_word}' must always be translated the same way throughout the book")
+            else:
+                rules.append(f"- '{src_word}' must be translated as '{tgt_word}'")
         glossary_txt = "\n".join(rules)
         system_prompt += f"\n\nGlossary (ensure these are applied):\n{glossary_txt}"
 
@@ -232,7 +240,9 @@ def _proofread_batch(originals: list[str], translations: list[str], source_lang:
     return translations
 
 
-def _translate_batch(paragraphs: list[str], source_lang: str = "en", glossary: dict | None = None) -> list[str]:
+def _translate_batch(paragraphs: list[str], source_lang: str = "en",
+                        glossary: dict | None = None,
+                        context_before: list[str] | None = None) -> list[str]:
     """Translate a batch of source paragraphs -> list of Korean paragraphs.
 
     The model is told to emit exactly len(paragraphs) chunks separated by the
@@ -240,16 +250,43 @@ def _translate_batch(paragraphs: list[str], source_lang: str = "en", glossary: d
     case seen on Pride & Prejudice Ch. IV), we fall back to single-paragraph
     calls so the bilingual EPUB doesn't end up with whole untranslated
     chapters.
+
+    context_before: optional list of 2-3 source paragraphs immediately
+    preceding this batch, passed as surrounding context so the model keeps
+    terminology, tone and pronoun reference consistent across batch
+    boundaries. Source-side (not translated) so it is available up front and
+    safe to compute for concurrent, out-of-order batches.
     """
     n = len(paragraphs)
+    # Stash HTML tags in all paragraphs before sending to the model
+    stashed_maps: list[dict[str, str]] = []
+    stashed_paras = []
+    for p in paragraphs:
+        stashed_text, tag_map = _stash_tags(p)
+        stashed_paras.append(stashed_text)
+        stashed_maps.append(tag_map)
+
     # Number each paragraph so the model can't silently merge them.
     numbered = "\n\n".join(
-        f"[{i+1}]\n{p}" for i, p in enumerate(paragraphs)
+        f"[{i+1}]\n{p}" for i, p in enumerate(stashed_paras)
     )
+
+    # Build context preamble if provided. This is the *source* text right
+    # before the batch — surrounding context only, NOT to be translated.
+    context_block = ""
+    if context_before:
+        context_samples = "\n\n".join(context_before[-3:])
+        context_block = (
+            f"\n\n--- Preceding {source_lang} context (do NOT translate; for "
+            f"terminology and tone consistency only) ---\n"
+            f"{context_samples}\n"
+            f"--- End context ---\n\n"
+        )
+
     user_msg = (
         f"Translate the following {n} {source_lang} paragraph(s) into Korean. "
         f"Emit exactly {n} Korean paragraphs separated by {PARA_DELIM} on its "
-        f"own line. Match input order.\n\n{numbered}"
+        f"own line. Match input order.{context_block}\n\n{numbered}"
     )
     raw = _chat([
         {"role": "system", "content": _system_prompt(source_lang, glossary)},
@@ -259,6 +296,9 @@ def _translate_batch(paragraphs: list[str], source_lang: str = "en", glossary: d
     # Strip any leading numbering the model echoed back ("[1] ...").
     parts = [re.sub(r"^\[\d+\]\s*", "", p) if p else p for p in parts]
     parts = [p for p in parts if p is not None]
+    # Restore HTML tags in each translated paragraph
+    parts = [_restore_tags(p, stashed_maps[i]) if i < len(stashed_maps) else p
+             for i, p in enumerate(parts)]
     
     # Apply 2-Pass Proofreading if enabled and draft is aligned
     if len(parts) == n:
@@ -298,10 +338,6 @@ def _translate_batch(paragraphs: list[str], source_lang: str = "en", glossary: d
         return _proofread_batch(paragraphs, padded, source_lang, glossary)
     return padded
 
-
-
-# late import to keep the module-level surface clean
-import re
 
 
 def translate_book(title: str, author: str, chapters: list[Chapter],
@@ -395,45 +431,55 @@ def translate_book(title: str, author: str, chapters: list[Chapter],
         sys.stderr.write("[translate] nothing to do (all units already translated)\n")
 
     # Run batches concurrently, filling translated slots as they complete.
+    # Each batch also receives the 3 source paragraphs immediately before it
+    # as surrounding context (computed up front from the source, so it works
+    # for out-of-order concurrent completion). Hard terminology consistency is
+    # carried by `glossary`; this context keeps tone/pronoun reference steady.
     last_ckpt = time.time()
     done_batches = 0
     total_batches = len(remaining)
+
+    def _commit_batch(ci: int, i: int, window: list[str], ko: list[str]) -> None:
+        """Write a completed batch's translations into chapter_pairs and flush
+        the checkpoint periodically. Mutates done_batches / last_ckpt."""
+        nonlocal done_batches, last_ckpt
+        for j, tr in enumerate(ko):
+            chapter_pairs[ci][i + j][1] = tr
+        done_batches += 1
+        if done_batches % 20 == 0:
+            sys.stderr.write(
+                f"[translate] {done_batches}/{total_batches} batches, "
+                f"{_count_done(chapter_pairs)}/{total} units\n"
+            )
+        # Flush checkpoint periodically so a crash loses ≤ ~1 min.
+        now = time.time()
+        if checkpoint_path and (done_batches % 30 == 0 or now - last_ckpt > 60):
+            _flush_checkpoint(checkpoint_path, title, author, fp,
+                              source_lang, chapters, chapter_pairs)
+            last_ckpt = now
+            if progress_cb:
+                progress_cb(_count_done(chapter_pairs), total)
+
     if remaining:
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futs = {
-                ex.submit(_translate_batch, window, source_lang, glossary): (ci, i, window)
-                for ci, i, window in remaining
-            }
+            futs = {}
+            for ci, i, window in remaining:
+                # Preceding source paragraphs (same chapter) as context.
+                context_before = chapters[ci].paragraphs[max(0, i - 3):i] or None
+                fut = ex.submit(_translate_batch, window, source_lang,
+                                glossary, context_before)
+                futs[fut] = (ci, i, window)
             for fut in as_completed(futs):
                 ci, i, window = futs[fut]
                 try:
                     ko = fut.result()
                 except TranslationError as e:
-                    # Non-fatal: leave blanks. A systemic failure (bad key)
-                    # surfaces in the FIRST batch's retries inside
-                    # _translate_batch and blanks everything, which the caller
-                    # can detect (all-empty output) and abort.
                     ko = [""] * len(window)
                     sys.stderr.write(
                         f"[translate] batch ch{ci}@{i} failed "
                         f"(left blank): {e}\n"
                     )
-                for j, tr in enumerate(ko):
-                    chapter_pairs[ci][i + j][1] = tr
-                done_batches += 1
-                if done_batches % 20 == 0:
-                    sys.stderr.write(
-                        f"[translate] {done_batches}/{total_batches} batches, "
-                        f"{_count_done(chapter_pairs)}/{total} units\n"
-                    )
-                # Flush checkpoint periodically so a crash loses ≤ ~1 min.
-                now = time.time()
-                if checkpoint_path and (done_batches % 30 == 0 or now - last_ckpt > 60):
-                    _flush_checkpoint(checkpoint_path, title, author, fp,
-                                      source_lang, chapters, chapter_pairs)
-                    last_ckpt = now
-                    if progress_cb:
-                        progress_cb(_count_done(chapter_pairs), total)
+                _commit_batch(ci, i, window, ko)
 
     # Final flush + assemble the TranslatedBook in chapter order.
     if checkpoint_path:

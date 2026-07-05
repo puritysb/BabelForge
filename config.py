@@ -120,6 +120,13 @@ TRANSLATION_LANG = "ko"
 # ─── Translation Quality Improvements ───
 TWO_PASS_TRANSLATION = True  # Enable 2-Pass (Draft + Proofread) translation
 GLOSSARY_PATH = os.path.join(DATA_DIR, "glossary.json")  # Terminology glossary path
+# Auto-glossary: pipeline.py extracts recurring proper nouns/terms before
+# translation and (when GLOSSARY_ENRICH) asks GLM for their canonical Korean
+# rendering, so a name/place is translated the same way across all 8 workers.
+# Enrichment costs one extra GLM call per book; on the z.ai Coding Plan that's
+# negligible and it clearly lifts terminology consistency, so default ON.
+GLOSSARY_ENABLED = True
+GLOSSARY_ENRICH = True
 
 
 
