@@ -11,3 +11,4 @@ soupsieve==2.8.4
 typing_extensions==4.15.0
 urllib3==2.7.0
 zeroconf==0.150.0
+mcp==1.28.1

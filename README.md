@@ -25,6 +25,17 @@ Orchestrator: `pipeline.py`. Config/paths: `config.py` (all paths derived from `
 the tree is relocatable). Entry points: `run_request.sh` (full pipeline), `start.sh` (detached),
 `search.py` (candidate search only).
 
+## Agent interface (MCP)
+
+BabelForge is a self-hosted appliance; agents drive it through the **`babelforge` MCP server**
+(`babelforge_mcp.py`) rather than the CLI. It runs streamable-HTTP under launchd
+(`com.local.babelforge-mcp`, `http://127.0.0.1:8770/mcp`) and exposes four tools:
+`search_books`, `translate_book` (returns a `req_id`; the pipeline runs detached), `get_status`,
+`list_recent`. Deploy: `cp deploy/com.local.babelforge-mcp.plist ~/Library/LaunchAgents/ &&
+launchctl load -w ~/Library/LaunchAgents/com.local.babelforge-mcp.plist`. Register the URL in
+your MCP client (repo `.mcp.json` for Claude Code; `openclaw mcp add`). The CLI below remains a
+fallback.
+
 ## External dependencies (not vendored here)
 
 BabelForge is a self-contained Python project, but it leans on four things outside it:

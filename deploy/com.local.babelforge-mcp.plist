@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  BabelForge MCP server — launchd appliance unit.
+  Install: cp deploy/com.local.babelforge-mcp.plist ~/Library/LaunchAgents/
+           launchctl load -w ~/Library/LaunchAgents/com.local.babelforge-mcp.plist
+  Serves streamable-HTTP MCP at http://127.0.0.1:8770/mcp (see config.py MCP_PORT).
+  Paths are absolute (a plist can't derive them) — repoint if the repo moves.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.local.babelforge-mcp</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/puritysb/github/BabelForge/venv/bin/python3</string>
+        <string>/Users/puritysb/github/BabelForge/babelforge_mcp.py</string>
+        <string>--http</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/puritysb/github/BabelForge</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/puritysb/github/BabelForge/logs/mcp.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/puritysb/github/BabelForge/logs/mcp.err.log</string>
+</dict>
+</plist>

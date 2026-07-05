@@ -41,6 +41,22 @@ long-presses Confirm to cycle Both → Original only → Translation only.
 
 ## How the agent drives it
 
+**Preferred: the `babelforge` MCP server** (launchd `com.local.babelforge-mcp`,
+`http://127.0.0.1:8770/mcp`). If your host has it, drive the appliance with typed
+tools instead of shelling out — no paths, no JSONL parsing:
+
+- `search_books(query)` → candidate list (prefix `annas:` to opt in; pass a file
+  path for a local file). Show up to 8, let the user pick one.
+- `translate_book(candidate)` → returns a `req_id` immediately; the pipeline runs
+  in the background (~1-2h). Pass the exact candidate dict the user chose.
+- `get_status(req_id)` → progress %, then `published` (epub_path/opds_url) or
+  `failed` (error). A failed run is resumable — re-running continues from its
+  checkpoint.
+- `list_recent(n)` → recent requests.
+
+The CLI below is the **fallback** for hosts without the MCP server (it calls the
+same code).
+
 ### 1. Search (return candidates to the user)
 
 ```bash

@@ -39,6 +39,13 @@ CHECKPOINT_DIR = os.path.join(DATA_DIR, "checkpoints")   # translation resume st
 
 VENV_PYTHON = os.path.join(BASE_DIR, "venv", "bin", "python3")
 
+# ─── BabelForge MCP server (agent-facing typed interface; babelforge_mcp.py) ───
+# The pipeline's own MCP *server* (distinct from the Z.ai MCP *client* below):
+# exposes search/translate/status tools so any MCP-capable agent drives the
+# appliance by URL instead of shelling out to scripts. Local-only bind.
+MCP_HOST = os.environ.get("BABELFORGE_MCP_HOST", "127.0.0.1")
+MCP_PORT = int(os.environ.get("BABELFORGE_MCP_PORT", "8770"))
+
 # ─── Calibre Content Server (OPDS delivery) ───
 CALIBRE_LIBRARY = os.path.expanduser("~/Calibre-Library")
 CALIBRE_PORT = 8080

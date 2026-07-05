@@ -41,6 +41,7 @@ request → search (Gutenberg / Standard Ebooks / Anna's / local)
 | `device_push.py` | HTTP POST push to the reader (mDNS/subnet discovery). |
 | `auto_push_watcher.py` + `pending_queue.py` | launchd-driven retry queue for device pushes. |
 | `catalog.py` | `data/catalog.json` state machine (requested → searching → selected → translating → assembling → published/failed). |
+| `babelforge_mcp.py` | **Agent-facing MCP server** (FastMCP) — the appliance's front door. Tools: `search_books` / `translate_book` (detached spawn, returns `req_id` immediately) / `get_status` / `list_recent`. A thin typed skin over the same functions the CLI uses. Runs streamable-HTTP under launchd `com.local.babelforge-mcp` (`http://127.0.0.1:8770/mcp`, `config.MCP_PORT`); `--http` for the appliance, stdio otherwise. Deploy plist: `deploy/com.local.babelforge-mcp.plist`. |
 
 ## Run
 
