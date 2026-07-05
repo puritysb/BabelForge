@@ -71,7 +71,7 @@ BabelForge is self-contained Python, but leans on four things outside it:
 
 ## Conventions & gotchas
 
-- **Secrets:** `.env` holds `GLM_API_KEY` (and optional device host). It is gitignored — never commit it, never print its values. `config.py::get_api_key()` reads env only.
+- **Secrets:** `.env` holds `GLM_API_KEY` (and optional device host). It is gitignored — never commit it, never print its values. `config.py::_load_dotenv()` populates `os.environ` from this repo's `.env` on import (via `setdefault`, so a real env var wins); the translator then reads the key as `ZAI_API_KEY` or the `GLM_API_KEY` fallback. No key is stored in code.
 - **Relocatable:** all paths come from `BASE_DIR = dirname(abspath(__file__))`. Do not introduce hardcoded `~/github/...` self-paths (references to the *sibling* crosspoint repo are the one allowed home-relative exception).
 - **venv:** was moved wholesale on the split, so `venv/bin/activate` and console-script shebangs hold the stale path. Invoking `venv/bin/python3` **directly** (as `run_request.sh` and the LaunchAgent do) works. If you need `activate`/console scripts, recreate the venv from `requirements.txt`.
 - **launchd:** `auto_push_watcher.py` runs under **`com.local.book-translator-watcher`** (`~/Library/LaunchAgents/…`, `StartInterval` 20s, `--once`). If you move/rename this dir, repoint that plist (6 path occurrences). Logs: `logs/watcher.{out,err}.log`.

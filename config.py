@@ -52,7 +52,7 @@ OPDS_BASE_URL = f"https://{OPDS_DOMAIN}"
 OPDS_FEED_URL = f"{OPDS_BASE_URL}/opds"
 
 # ─── Translation (GLM-5.2 via Zhipu AI / OpenAI-compatible) ───
-# API key is NOT stored here. Set in book_translator/.env or the environment.
+# API key is NOT stored here. Set it in this repo's .env or the environment.
 # Accept both ZAI_API_KEY and GLM_API_KEY (Zhipu's preferred name).
 ZAI_BASE_URL = "https://api.z.ai/api/coding/paas/v4"
 ZAI_MODEL = "glm-5.2"                                    # 1M context, 8192 maxTokens

@@ -19,7 +19,7 @@ cd "$BT_DIR"
 
 if [[ -z "${ZAI_API_KEY:-}" && -z "${GLM_API_KEY:-}" ]]; then
   echo "ERROR: neither ZAI_API_KEY nor GLM_API_KEY is set." >&2
-  echo "  Put GLM_API_KEY=... in book_translator/.env (preferred — config.py" >&2
+  echo "  Put GLM_API_KEY=... in this repo's .env (preferred — config.py" >&2
   echo "  auto-loads it) or export ZAI_API_KEY/GLM_API_KEY in the environment." >&2
   exit 3
 fi
