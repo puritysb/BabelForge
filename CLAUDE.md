@@ -81,6 +81,7 @@ BabelForge is self-contained Python, but leans on four things outside it:
 - **launchd:** `auto_push_watcher.py` runs under **`com.local.book-translator-watcher`** (`~/Library/LaunchAgents/…`, `StartInterval` 20s, `--once`). If you move/rename this dir, repoint that plist (6 path occurrences). Logs: `logs/watcher.{out,err}.log`.
 - **EPUB format is a contract:** only block-level `<p>` `cp-original`/`cp-translation`; single-file bilingual (ESP32-C3 can't hold two EPUBs in RAM). Don't emit `<span>` markers.
 - **Anna's Archive** is opt-in only via the `annas:` prefix; default search never touches it (copyright = user's responsibility).
+- **Checkpoint resume never regresses:** a re-queued batch window can mix already-translated paragraphs with blank ones (windows are recomputed each run and can shift, e.g. after a batching change), so if that batch ultimately fails, `_commit_batch` in `translate.py` must never overwrite an already non-blank slot with a blank result. This bit us live — a resumed run's rate-limit failures wiped ~90 previously-good translations before the guard was added. Preserve that invariant if you touch `_commit_batch`.
 - **Gitignored:** `venv/`, `.env`, `data/`, `logs/`, `__pycache__/` (see `.gitignore`).
 
 ## Multi-agent harness
