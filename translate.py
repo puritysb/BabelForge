@@ -384,6 +384,27 @@ def _translate_batch(paragraphs: list[str], source_lang: str = "en",
 
 
 
+def _plan_windows(paragraphs: list[str], max_paras: int, max_chars: int) -> list[tuple[int, list[str]]]:
+    """Pack paragraphs into (start_index, window) batches bounded by BOTH a
+    paragraph count and a source-character budget. Dense prose thus yields
+    small batches (whose Korean output stays under the model's token ceiling)
+    while short paragraphs still pack up to max_paras. An oversized single
+    paragraph is its own window."""
+    windows: list[tuple[int, list[str]]] = []
+    i, n = 0, len(paragraphs)
+    while i < n:
+        j, chars = i, 0
+        while j < n and (j - i) < max_paras:
+            plen = len(paragraphs[j])
+            if j > i and chars + plen > max_chars:
+                break
+            chars += plen
+            j += 1
+        windows.append((i, paragraphs[i:j]))
+        i = j
+    return windows
+
+
 def translate_book(title: str, author: str, chapters: list[Chapter],
                    progress_cb=None, source_lang: str = "en",
                    checkpoint_path: str | None = None,
@@ -459,15 +480,15 @@ def translate_book(title: str, author: str, chapters: list[Chapter],
                 pairs[j][1] = pair[1] if len(pair) >= 2 else ""
         chapter_pairs[ci] = pairs
 
-    batch = config.TRANSLATE_BATCH_PARAGRAPHS
+    max_paras = config.TRANSLATE_BATCH_PARAGRAPHS
+    max_chars = config.TRANSLATE_BATCH_MAX_CHARS
     # Build the remaining work queue: (chapter_idx, start_offset, window).
     # A batch is re-queued if ANY of its slots is still blank — this fills
-    # gaps left by earlier 429-exhaustion failures without redoing good work.
+    # gaps left by earlier failures without redoing good work.
     remaining: list[tuple[int, int, list[str]]] = []
     for ci, ch in enumerate(chapters):
         pairs = chapter_pairs[ci]
-        for i in range(0, len(ch.paragraphs), batch):
-            window = ch.paragraphs[i:i + batch]
+        for i, window in _plan_windows(ch.paragraphs, max_paras, max_chars):
             if any(not pairs[i + j][1].strip() for j in range(len(window))):
                 remaining.append((ci, i, window))
 

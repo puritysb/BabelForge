@@ -66,7 +66,13 @@ ZAI_MODEL = "glm-5.2"                                    # 1M context, 8192 maxT
 ZAI_API_KEY_ENV = "ZAI_API_KEY"                          # primary env var
 ZAI_API_KEY_FALLBACK_ENV = "GLM_API_KEY"                 # alias Zhipu ships with
 ZAI_MAX_TOKENS = 8192
-TRANSLATE_BATCH_PARAGRAPHS = 20                          # paragraphs per GLM call (GLM-5.2 1M ctx)
+TRANSLATE_BATCH_PARAGRAPHS = 20                          # max paragraphs per GLM call
+# Also cap a batch by total *source* characters: dense prose (long paragraphs)
+# translated 20-at-a-time can push the Korean output past ZAI_MAX_TOKENS (8192),
+# which truncates/collapses the response and forces slow per-paragraph fallback.
+# Packing to a char budget keeps output well under the ceiling and improves
+# throughput. Small paragraphs still batch up to TRANSLATE_BATCH_PARAGRAPHS.
+TRANSLATE_BATCH_MAX_CHARS = 2200
 TRANSLATE_MAX_RETRIES = 4
 TRANSLATE_TIMEOUT_S = 240
 TRANSLATE_WORKERS = 8  # concurrent GLM calls (each ~20s on the coding plan;
