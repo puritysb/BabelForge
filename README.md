@@ -89,8 +89,10 @@ export ZAI_API_KEY=<your GLM Coding Plan key>   # or put GLM_API_KEY=... in .env
 ```
 
 The pipeline runs fetch → extract → auto-glossary → translate → assemble → publish → device push,
-updating `data/catalog.json` at each step. A novel takes ~1–2h (8 concurrent GLM workers);
-translation is checkpointed, so a killed run resumes where it left off on rerun.
+updating `data/catalog.json` at each step. A novel takes ~1–2h (2 concurrent GLM workers — lowered from 8 to stay under
+the Coding Plan's 429 rate limit); translation is checkpointed, so a killed
+run resumes where it left off on rerun, and a slot once translated is never
+blanked by a later failed batch.
 
 ```bash
 # Progress: last few requests and their status.
