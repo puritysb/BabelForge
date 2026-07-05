@@ -16,8 +16,9 @@ is **relocatable** (no hardcoded absolute paths — keep it that way).
 request → search (Gutenberg / Standard Ebooks / Anna's / local)
         → fetch source → extract chapters (BeautifulSoup / ebooklib)
         → auto-glossary (recurring names/terms → canonical Korean, web-search-grounded via Z.ai MCP)
-        → GLM translation (paragraph-aligned, 20/batch, 8 workers, 2-pass draft+proofread,
-                           HTML-tag preserving, glossary + preceding-source-context aware)
+        → GLM translation (paragraph-aligned, char-budget-capped batches, concurrent
+                           GLM workers, 2-pass draft+proofread, HTML-tag preserving,
+                           glossary + preceding-source-context aware)
         → assemble bilingual EPUB (cp-original / cp-translation block-level <p> markers)
         → publish: calibredb add → Calibre Content Server OPDS feed
         → best-effort HTTP push to the XTeink reader (skipped silently if unreachable)
@@ -33,7 +34,7 @@ request → search (Gutenberg / Standard Ebooks / Anna's / local)
 | `search.py` | Catalog search → JSONL candidates; `openclaw message send` LINE notify. |
 | `sources/` | Source adapters (`gutenberg`, `standard_ebooks`, `annas_archive`, `local_file`), dispatched via `sources/__init__.py::get_adapter()`. |
 | `extract.py` | Chapter/paragraph extraction. |
-| `translate.py` | **GLM translation engine** — the biggest file. System prompt is **inline** (literary-translator). Batch output is aligned by **numbered `[k]` markers** (`_parse_numbered_slots` — GLM keeps an explicit numbered list far more reliably than a lone `⟦P⟧` delimiter); missing slots are back-filled by single-paragraph calls, so a partial/collapsed batch keeps its good paragraphs. Plus batching, backoff, checkpoint resume, 2-pass. Also: **inline-HTML tag stashing** (`_stash_tags`/`_restore_tags` swap `<i>/<b>/<em>/…` for PUA placeholders so GLM can't mangle them), **glossary** enforcement in the system prompt, and **source-side context** (each batch gets the preceding 3 source paragraphs — parallel-safe, keeps tone/terminology steady across the 8 workers). |
+| `translate.py` | **GLM translation engine** — the biggest file. System prompt is **inline** (literary-translator). Batch output is aligned by **numbered `[k]` markers** (`_parse_numbered_slots` — GLM keeps an explicit numbered list far more reliably than a lone `⟦P⟧` delimiter); missing slots are back-filled by single-paragraph calls, so a partial/collapsed batch keeps its good paragraphs. Plus batching, backoff, checkpoint resume, 2-pass. Also: **inline-HTML tag stashing** (`_stash_tags`/`_restore_tags` swap `<i>/<b>/<em>/…` for PUA placeholders so GLM can't mangle them), **glossary** enforcement in the system prompt, and **source-side context** (each batch gets the preceding 3 source paragraphs — parallel-safe, keeps tone/terminology steady across concurrent workers, `config.TRANSLATE_WORKERS`). |
 | `glossary_builder.py` | Auto-glossary — scans source chapters for recurring proper nouns/terms (`build_glossary_from_chapters`) and resolves their canonical Korean rendering. Default (`enrich_glossary_grounded`) **web-searches the top terms via the Z.ai MCP tool** (`mcp_client.py`) and grounds GLM's extraction in real published usage; `enrich_glossary_with_llm` is the offline fallback (plain guess). `pipeline.py` runs it before translation and passes the result to `translate_book`; also a standalone CLI (`--enrich`, `--no-web-search`) writing `config.GLOSSARY_PATH`. |
 | `mcp_client.py` | Minimal **self-contained MCP (Streamable-HTTP) client** — no Node dependency. Speaks initialize → notifications/initialized → tools/call over urllib against Z.ai MCP servers, authed with the Coding-Plan key. Exposes `web_search(query)`; fails soft (returns `[]`, never raises) so a search hiccup never blocks translation. |
 | `assemble.py` | Builds the bilingual EPUB. Emits **block-level `<p class="cp-original">` / `<p class="cp-translation">` only** — never `<span>` (firmware parser contract). |

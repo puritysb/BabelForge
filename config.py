@@ -75,8 +75,8 @@ TRANSLATE_BATCH_PARAGRAPHS = 20                          # max paragraphs per GL
 TRANSLATE_BATCH_MAX_CHARS = 2200
 TRANSLATE_MAX_RETRIES = 4
 TRANSLATE_TIMEOUT_S = 240
-TRANSLATE_WORKERS = 8  # concurrent GLM calls (each ~20s on the coding plan;
-                       # serial = ~12h for a 9000-sentence novel, 8 workers ≈ 1.5h)
+TRANSLATE_WORKERS = 2  # concurrent GLM calls (each ~20s on the coding plan;
+                       # reduced from 8 due to GLM 429 rate limiting)
 
 # Bilingual granularity. When True (default), source paragraphs are split
 # into sentences BEFORE translation, so each cp-original / cp-translation
@@ -135,7 +135,7 @@ TWO_PASS_TRANSLATION = True  # Enable 2-Pass (Draft + Proofread) translation
 GLOSSARY_PATH = os.path.join(DATA_DIR, "glossary.json")  # Terminology glossary path
 # Auto-glossary: pipeline.py extracts recurring proper nouns/terms before
 # translation and (when GLOSSARY_ENRICH) asks GLM for their canonical Korean
-# rendering, so a name/place is translated the same way across all 8 workers.
+# rendering, so a name/place is translated the same way across all concurrent workers.
 # Enrichment costs one extra GLM call per book; on the z.ai Coding Plan that's
 # negligible and it clearly lifts terminology consistency, so default ON.
 GLOSSARY_ENABLED = True

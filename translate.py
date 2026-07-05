@@ -421,8 +421,9 @@ def translate_book(title: str, author: str, chapters: list[Chapter],
         The checkpoint is validated against a hash of the source paragraphs so
         a stale file from a different book is never wrongly resumed.
     max_workers: concurrent GLM calls. The coding-plan endpoint takes ~20s per
-        call, so serial translation of a 9000-sentence novel takes ~12h; 8
-        workers brings it to ~1.5h. Default: config.TRANSLATE_WORKERS.
+        call, so serial translation of a 9000-sentence novel takes ~12h; more
+        workers speeds it up proportionally, bounded by 429 rate limiting.
+        Default: config.TRANSLATE_WORKERS.
     glossary: optional dictionary of term mappings. If not provided, attempts to
         load a default glossary from config.GLOSSARY_PATH.
 
