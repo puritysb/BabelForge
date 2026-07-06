@@ -1,7 +1,7 @@
 # BabelForge
 
 Public-domain book → **bilingual (original + Korean) EPUB** → **Calibre OPDS** pipeline, with
-best-effort push to an XTeink X3/X4 e-ink reader. Served at **books.getlingo.store**.
+best-effort push to an XTeink X3/X4 e-ink reader. Served at **books.foundby.kr**.
 
 A standalone Python project, split out of the `OpenClaw` ops repo on 2026-07-05 (it was never
 tracked there — this repo's history starts fresh). Read this file first; the user-facing
@@ -69,7 +69,7 @@ BabelForge is self-contained Python, but leans on four things outside it:
 |---|---|---|
 | **`crosspoint-agentdeck`** (sibling checkout `~/github/crosspoint-agentdeck`) | The **bilingual-EPUB format** is defined there — `docs/bilingual-epub.md` is the **SSOT**. `assemble.py`'s skeleton derives from its `scripts/generate_bilingual_test_epub.py`; `build_font.py` reads its `lib/EpdFont/scripts`. | Producer↔consumer. This pipeline is the **producer**; the reader firmware is the consumer. A format change is breaking on both sides — coordinate via that doc. |
 | **`openclaw` CLI** (`/opt/homebrew/bin/openclaw`) | LINE notifications (`search.py`, `config.py:OPENCLAW_BIN`). | One `openclaw message send` subprocess call — no code dependency. |
-| **Calibre Content Server** (launchd `com.local.calibre-server`, port 8080; cloudflared `com.getlingo.openclaw.cloudflared`) | Hosts the OPDS feed at `books.getlingo.store/opds`. `publish.py` only calls `calibredb add`. | External service (KeepAlive launchd). |
+| **Calibre Content Server** (launchd `com.local.calibre-server`, port 8080; cloudflared `com.getlingo.openclaw.cloudflared`) | Hosts the OPDS feed at `books.foundby.kr/opds`. `publish.py` only calls `calibredb add`. The older `books.getlingo.store` route may remain as a compatibility alias, but generated BabelForge links use `books.foundby.kr`. | External service (KeepAlive launchd). |
 | **ZAI / GLM API** (`api.z.ai`, model `glm-5.2`) | Translation engine. Key from `.env` (`ZAI_API_KEY` or `GLM_API_KEY`) — **never hardcode**. | External API. |
 | **Z.ai MCP** (`api.z.ai/api/mcp/web_search_prime`, tool `web_search_prime`) | Grounds auto-glossary term renderings in published usage (`mcp_client.py`). Same Coding-Plan key; MCP is entitled on it independently of REST. | External MCP (Streamable HTTP). Optional — glossary degrades to an LLM guess if unreachable. |
 

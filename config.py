@@ -54,7 +54,7 @@ CALIBREDB = "/opt/homebrew/bin/calibredb"
 # blocked while calibre-server holds the library lock). --enable-local-write
 # is on, so the server accepts writes from localhost.
 CALIBREDB_URL = f"http://localhost:{CALIBRE_PORT}"
-OPDS_DOMAIN = "books.getlingo.store"                     # cloudflared → localhost:8080
+OPDS_DOMAIN = "books.foundby.kr"                         # cloudflared → localhost:8080
 OPDS_BASE_URL = f"https://{OPDS_DOMAIN}"
 OPDS_FEED_URL = f"{OPDS_BASE_URL}/opds"
 
