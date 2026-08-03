@@ -10,11 +10,14 @@ tracked in OpenClaw's git history — this repo's history starts fresh.
 
 ```
 request → search (Gutenberg / Standard Ebooks / Anna's / local)
+        → research source provenance; replace relay translation with a verified
+          public-domain original-language edition when available
         → fetch → extract chapters (BeautifulSoup)
-        → build auto-glossary (recurring names/terms → canonical Korean,
-                               web-search-grounded via Z.ai MCP)
-        → GLM translation (paragraph-aligned, batched, 2-pass draft+proofread,
-                            HTML-tag preserving, glossary + source-context aware)
+        → build a structured concept sheet (whole-book candidates → web evidence
+          → Korean adjudication → adversarial cross-check → schema normalization)
+        → GLM precision translation (paragraph-aligned, batched, semantic
+          proofread, HTML-tag preserving, concept-sheet + source-context aware)
+        → fail-closed whole-book terminology audit and contextual repair
         → assemble bilingual EPUB (cp-original / cp-translation markers)
         → publish: calibredb add → Calibre Content Server OPDS feed
         → best-effort HTTP push to the XTeink e-ink reader
@@ -88,11 +91,13 @@ export ZAI_API_KEY=<your GLM Coding Plan key>   # or put GLM_API_KEY=... in .env
 ./run_request.sh candidate.json
 ```
 
-The pipeline runs fetch → extract → auto-glossary → translate → assemble → publish → device push,
-updating `data/catalog.json` at each step. A novel takes ~1–2h (2 concurrent GLM workers — lowered from 8 to stay under
-the Coding Plan's 429 rate limit); translation is checkpointed, so a killed
-run resumes where it left off on rerun, and a slot once translated is never
-blanked by a later failed batch.
+The pipeline has no fast mode: every request runs source research → extract → autonomous
+concept research/cross-validation → translate → whole-book quality audit → assemble → publish
+→ device push, updating `data/catalog.json` at each step. Translation uses 2 concurrent GLM
+workers (lowered from 8 to stay under the Coding Plan's 429 rate limit). It is checkpointed
+against both source text and the precision profile, so a killed run resumes safely while an
+updated prompt or concept decision cannot reuse stale translations. A slot once translated is
+never blanked by a later failed batch.
 
 ```bash
 # Progress: last few requests and their status.

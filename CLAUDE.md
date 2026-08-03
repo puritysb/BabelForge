@@ -14,11 +14,16 @@ is **relocatable** (no hardcoded absolute paths — keep it that way).
 
 ```
 request → search (Gutenberg / Standard Ebooks / Anna's / local)
+        → mandatory source research (autonomously prefer a verified public-domain
+                                     original-language edition over relay translation)
         → fetch source → extract chapters (BeautifulSoup / ebooklib)
-        → auto-glossary (recurring names/terms → canonical Korean, web-search-grounded via Z.ai MCP)
-        → GLM translation (paragraph-aligned, char-budget-capped batches, concurrent
-                           GLM workers, 2-pass draft+proofread, HTML-tag preserving,
-                           glossary + preceding-source-context aware)
+        → structured concept sheet (whole-book candidates → web grounding
+                                    → adjudication → adversarial cross-check
+                                    → enforcement-schema normalization)
+        → GLM precision translation (paragraph-aligned, char-budget-capped batches,
+                                     concurrent workers, semantic proofread,
+                                     HTML-tag + concept distinctions preserved)
+        → fail-closed whole-book terminology audit + contextual repair
         → assemble bilingual EPUB (cp-original / cp-translation block-level <p> markers)
         → publish: calibredb add → Calibre Content Server OPDS feed
         → best-effort HTTP push to the XTeink reader (skipped silently if unreachable)
@@ -35,13 +40,15 @@ request → search (Gutenberg / Standard Ebooks / Anna's / local)
 | `sources/` | Source adapters (`gutenberg`, `standard_ebooks`, `annas_archive`, `local_file`), dispatched via `sources/__init__.py::get_adapter()`. |
 | `extract.py` | Chapter/paragraph extraction. |
 | `translate.py` | **GLM translation engine** — the biggest file. System prompt is **inline** (literary-translator). Batch output is aligned by **numbered `[k]` markers** (`_parse_numbered_slots` — GLM keeps an explicit numbered list far more reliably than a lone `⟦P⟧` delimiter); missing slots are back-filled by single-paragraph calls, so a partial/collapsed batch keeps its good paragraphs. Plus batching, backoff, checkpoint resume, 2-pass. Also: **inline-HTML tag stashing** (`_stash_tags`/`_restore_tags` swap `<i>/<b>/<em>/…` for PUA placeholders so GLM can't mangle them), **glossary** enforcement in the system prompt, and **source-side context** (each batch gets the preceding 3 source paragraphs — parallel-safe, keeps tone/terminology steady across concurrent workers, `config.TRANSLATE_WORKERS`). |
-| `glossary_builder.py` | Auto-glossary — scans source chapters for recurring proper nouns/terms (`build_glossary_from_chapters`) and resolves their canonical Korean rendering. Default (`enrich_glossary_grounded`) **web-searches the top terms via the Z.ai MCP tool** (`mcp_client.py`) and grounds GLM's extraction in real published usage; `enrich_glossary_with_llm` is the offline fallback (plain guess). `pipeline.py` runs it before translation and passes the result to `translate_book`; also a standalone CLI (`--enrich`, `--no-web-search`) writing `config.GLOSSARY_PATH`. |
+| `precision.py` | **Mandatory precision preflight** — researches original language/title, autonomously replaces a relay catalog source when a verified public-domain original is available, extracts lowercase/multiword and rare lexical-neighbor concepts across the book, gathers web evidence, then runs adjudicator + adversarial critic + enforcement-schema normalization passes. Malformed JSON is repaired autonomously. Writes a structured, request-scoped concept sheet under `data/concepts/`. |
+| `quality_audit.py` | **Fail-closed pre-publication audit** — checks every strict source concept occurrence for the canonical Korean term and forbidden variants, repairs violations in context through GLM, and rejects the book if any remain. |
+| `glossary_builder.py` | Legacy standalone flat-glossary utility. The production pipeline no longer uses this best-effort path; `precision.py` owns mandatory structured terminology research. |
 | `mcp_client.py` | Minimal **self-contained MCP (Streamable-HTTP) client** — no Node dependency. Speaks initialize → notifications/initialized → tools/call over urllib against Z.ai MCP servers, authed with the Coding-Plan key. Exposes `web_search(query)`; fails soft (returns `[]`, never raises) so a search hiccup never blocks translation. |
 | `assemble.py` | Builds the bilingual EPUB. Emits **block-level `<p class="cp-original">` / `<p class="cp-translation">` only** — never `<span>` (firmware parser contract). |
 | `publish.py` | `calibredb add` into `~/Calibre-Library`. |
 | `device_push.py` | HTTP POST push to the reader (mDNS/subnet discovery). |
 | `auto_push_watcher.py` + `pending_queue.py` | launchd-driven retry queue for device pushes. |
-| `catalog.py` | `data/catalog.json` state machine (requested → searching → selected → translating → assembling → published/failed). |
+| `catalog.py` | `data/catalog.json` state machine (requested → researching → selected → analyzing → translating → quality_checked → assembling → published/failed). |
 | `babelforge_mcp.py` | **Agent-facing MCP server** (FastMCP) — the appliance's front door. Tools: `search_books` / `translate_book` (detached spawn, returns `req_id` immediately) / `get_status` / `list_recent`. A thin typed skin over the same functions the CLI uses. Runs streamable-HTTP under launchd `com.local.babelforge-mcp` (`http://127.0.0.1:8770/mcp`, `config.MCP_PORT`); `--http` for the appliance, stdio otherwise. Deploy plist: `deploy/com.local.babelforge-mcp.plist`. |
 
 ## Run
@@ -71,7 +78,7 @@ BabelForge is self-contained Python, but leans on four things outside it:
 | **`openclaw` CLI** (`/opt/homebrew/bin/openclaw`) | LINE notifications (`search.py`, `config.py:OPENCLAW_BIN`). | One `openclaw message send` subprocess call — no code dependency. |
 | **Calibre Content Server** (launchd `com.local.calibre-server`, port 8080; cloudflared `com.getlingo.openclaw.cloudflared`) | Hosts the OPDS feed at `books.foundby.kr/opds`. `publish.py` only calls `calibredb add`. The older `books.getlingo.store` route may remain as a compatibility alias, but generated BabelForge links use `books.foundby.kr`. | External service (KeepAlive launchd). |
 | **ZAI / GLM API** (`api.z.ai`, model `glm-5.2`) | Translation engine. Key from `.env` (`ZAI_API_KEY` or `GLM_API_KEY`) — **never hardcode**. | External API. |
-| **Z.ai MCP** (`api.z.ai/api/mcp/web_search_prime`, tool `web_search_prime`) | Grounds auto-glossary term renderings in published usage (`mcp_client.py`). Same Coding-Plan key; MCP is entitled on it independently of REST. | External MCP (Streamable HTTP). Optional — glossary degrades to an LLM guess if unreachable. |
+| **Z.ai MCP** (`api.z.ai/api/mcp/web_search_prime`, tool `web_search_prime`) | Grounds source provenance and concept decisions in external evidence (`precision.py`, `mcp_client.py`). Same Coding-Plan key; MCP is entitled on it independently of REST. | External MCP (Streamable HTTP). Individual searches fail soft; source-context adjudication and an adversarial cross-check remain mandatory. |
 
 ## Conventions & gotchas
 
@@ -82,6 +89,7 @@ BabelForge is self-contained Python, but leans on four things outside it:
 - **EPUB format is a contract:** only block-level `<p>` `cp-original`/`cp-translation`; single-file bilingual (ESP32-C3 can't hold two EPUBs in RAM). Don't emit `<span>` markers.
 - **Anna's Archive** is opt-in only via the `annas:` prefix; default search never touches it (copyright = user's responsibility).
 - **Checkpoint resume never regresses:** a re-queued batch window can mix already-translated paragraphs with blank ones (windows are recomputed each run and can shift, e.g. after a batching change), so if that batch ultimately fails, `_commit_batch` in `translate.py` must never overwrite an already non-blank slot with a blank result. This bit us live — a resumed run's rate-limit failures wiped ~90 previously-good translations before the guard was added. Preserve that invariant if you touch `_commit_batch`.
+- **Precision is mandatory:** there is no fast/best-effort production mode. Concept research failures and unresolved strict-term audit failures stop publication. Checkpoints are keyed by both source hash and precision-profile hash, so terminology/prompt changes intentionally restart stale work.
 - **Gitignored:** `venv/`, `.env`, `data/`, `logs/`, `__pycache__/` (see `.gitignore`).
 
 ## Multi-agent harness

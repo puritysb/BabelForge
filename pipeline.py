@@ -1,7 +1,8 @@
 """End-to-end pipeline orchestrator.
 
-Given a chosen Candidate (JSON), run: fetch → extract → translate → assemble
-→ publish, updating catalog.json at each step and notifying LINE on success.
+Given a chosen Candidate (JSON), run: source research → fetch → extract →
+concept research/cross-check → precision translate/audit → assemble → publish,
+updating catalog.json at each step and notifying LINE on success.
 
 Invoked by run_request.sh, which the OpenClaw agent calls after the user picks
 a candidate from the search results.
@@ -23,6 +24,12 @@ from translate import translate_book, TranslationError
 from assemble import assemble as assemble_epub
 from publish import publish as publish_epub
 from device_push import push_to_device
+from precision import (PRECISION_PROFILE_VERSION, PRECISION_SCHEMA_VERSION,
+                       PrecisionError, build_concept_sheet,
+                       choose_original_candidate, flat_glossary,
+                       persist_concept_sheet, precision_profile_hash,
+                       research_source,
+                       source_fingerprint)
 
 
 def run(candidate: dict, req_id: str | None = None,
@@ -32,60 +39,105 @@ def run(candidate: dict, req_id: str | None = None,
         req_id = catalog.new_request(query)
 
     try:
-        # 1. fetch
-        catalog.update(req_id, status="selected")
-        adapter = get_adapter(candidate["source"])
+        # 1. Mandatory precision source research. If the selected catalog item
+        # is a relay translation, autonomously prefer an original-language,
+        # public-domain edition from the safe default sources when available.
+        catalog.update(req_id, status="researching")
         from sources import Candidate
-        cand = Candidate(**{k: v for k, v in candidate.items() if k != "extra"})
-        cand.extra = candidate.get("extra")
+        import translate as _translate
+        from mcp_client import web_search
+        concept_path = os.path.join(config.CONCEPT_DIR, f"{req_id}.json")
+        previous = catalog.get(req_id) or {}
+        saved_candidate = previous.get("selected")
+        if (os.path.isfile(concept_path) and isinstance(saved_candidate, dict)
+                and isinstance(previous.get("source_research"), dict)):
+            cand = Candidate(**{k: v for k, v in saved_candidate.items()
+                                if k != "extra"})
+            cand.extra = saved_candidate.get("extra")
+            source_research = previous["source_research"]
+            source_replaced = bool(previous.get("source_replaced"))
+            sys.stderr.write(
+                "[precision] reused request-scoped source resolution\n"
+            )
+        else:
+            cand = Candidate(**{k: v for k, v in candidate.items()
+                                if k != "extra"})
+            cand.extra = candidate.get("extra")
+            source_research = research_source(
+                cand, chat_fn=_translate._chat, search_fn=web_search)
+
+            def _search_original(q: str):
+                return search_mod.search_all(
+                    q, sources=list(config.DEFAULT_SOURCES), limit_per_source=10)
+
+            resolved, source_replaced = choose_original_candidate(
+                cand, source_research, _search_original)
+            cand = Candidate(**{k: v for k, v in resolved.items()
+                                if k != "extra"})
+            cand.extra = resolved.get("extra")
+            if source_replaced:
+                source_research = {
+                    **source_research,
+                    "relay_source_replaced": True,
+                    "source_language": (cand.language or "").split("-")[0].lower(),
+                    "source_is_translation": False,
+                    "resolved_source": {
+                        "source": cand.source, "source_id": cand.source_id,
+                        "title": cand.title, "language": cand.language,
+                    },
+                }
+        catalog.update(req_id, status="selected", selected=cand.to_dict(),
+                       source_research=source_research,
+                       source_replaced=source_replaced)
+        if source_replaced:
+            sys.stderr.write(
+                f"[precision] replaced relay source with original-language "
+                f"edition: {cand.title} [{cand.language}]\n"
+            )
+
+        # 2. fetch + extract
+        adapter = get_adapter(cand.source)
         src = adapter.fetch(cand)
-
-        # 2. extract
         chapters = extract(src)
-        catalog.update(req_id, status="translating",
-                       progress={"done": 0, "total": sum(len(c.paragraphs) for c in chapters), "pct": 0})
-
-        # 3. translate
         source_lang = (cand.language or "en").split("-")[0].lower()
         checkpoint_path = os.path.join(config.CHECKPOINT_DIR, f"{req_id}.json")
 
-        # 3a. auto-glossary: extract recurring proper nouns/terms and (best-
-        # effort) look up their canonical Korean rendering, so every one of the
-        # concurrent workers translates a name/place the same way. Persisted to
-        # config.GLOSSARY_PATH for debug visibility, then passed explicitly.
-        glossary = None
-        if config.GLOSSARY_ENABLED:
+        # 3. Mandatory autonomous concept research. This is fail-closed: a bad
+        # research response never degrades silently into the old fast path.
+        catalog.update(req_id, status="analyzing",
+                       progress={"done": 0,
+                                 "total": sum(len(c.paragraphs) for c in chapters),
+                                 "pct": 0})
+        concept_sheet = None
+        if os.path.isfile(concept_path):
             try:
-                from glossary_builder import (build_glossary_from_chapters,
-                                              enrich_glossary_with_llm,
-                                              enrich_glossary_grounded)
-                glossary = build_glossary_from_chapters(chapters, source_lang)
-                if glossary and config.GLOSSARY_ENRICH:
-                    import translate as _translate
-                    if config.GLOSSARY_WEB_SEARCH:
-                        # Ground name/place renderings in real published usage
-                        # via the Z.ai web_search_prime MCP tool; falls back to
-                        # a plain LLM guess if no web results come back.
-                        glossary = enrich_glossary_grounded(
-                            glossary, source_lang, title=cand.title,
-                            _chat_fn=_translate._chat,
-                            top_terms=config.GLOSSARY_WEB_SEARCH_TERMS)
-                    else:
-                        glossary = enrich_glossary_with_llm(
-                            glossary, source_lang, _chat_fn=_translate._chat)
-                if glossary:
-                    os.makedirs(os.path.dirname(config.GLOSSARY_PATH), exist_ok=True)
-                    with open(config.GLOSSARY_PATH, "w", encoding="utf-8") as f:
-                        json.dump(glossary, f, ensure_ascii=False, indent=2)
+                with open(concept_path, "r", encoding="utf-8") as f:
+                    saved_sheet = json.load(f)
+                if (saved_sheet.get("source_hash") == source_fingerprint(chapters)
+                        and saved_sheet.get("schema_version") == PRECISION_SCHEMA_VERSION
+                        and saved_sheet.get("profile_version") == PRECISION_PROFILE_VERSION
+                        and saved_sheet.get("profile_hash") ==
+                            precision_profile_hash(saved_sheet)):
+                    concept_sheet = saved_sheet
                     sys.stderr.write(
-                        f"[pipeline] built glossary: {len(glossary)} terms "
-                        f"(enrich={config.GLOSSARY_ENRICH})\n"
+                        f"[precision] reused request-scoped concept sheet: "
+                        f"{concept_path}\n"
                     )
-            except Exception as e:
-                # Glossary is a quality boost, never a hard dependency — a
-                # failure here must not sink the whole translation.
-                sys.stderr.write(f"[pipeline] glossary build skipped: {e}\n")
-                glossary = None
+            except (OSError, json.JSONDecodeError) as e:
+                sys.stderr.write(
+                    f"[precision] concept sheet unreadable ({e}); rebuilding\n"
+                )
+        if concept_sheet is None:
+            concept_sheet = build_concept_sheet(
+                chapters=chapters, title=cand.title, author=cand.author,
+                source_lang=source_lang, source_research=source_research,
+                chat_fn=_translate._chat, search_fn=web_search)
+            persist_concept_sheet(concept_path, concept_sheet)
+        glossary = flat_glossary(concept_sheet)
+        catalog.update(req_id, status="translating",
+                       concept_sheet_path=concept_path,
+                       precision_profile=concept_sheet["profile_hash"],
+                       concepts=len(concept_sheet.get("concepts") or []))
 
         def progress_cb(done, total):
             catalog.set_progress(req_id, done, total)
@@ -109,7 +161,13 @@ def run(candidate: dict, req_id: str | None = None,
             source_lang=source_lang,
             checkpoint_path=checkpoint_path,
             glossary=glossary,
+            concept_sheet=concept_sheet,
         )
+
+        # translate_book performs the fail-closed whole-book concept audit and
+        # only returns after it passes.
+        catalog.update(req_id, status="quality_checked",
+                       quality_report=book.quality_report)
 
         # 4. assemble
         catalog.update(req_id, status="assembling")
@@ -175,11 +233,12 @@ def run(candidate: dict, req_id: str | None = None,
                 "opds_url": opds_url, "book_id": book_id,
                 "device_push": push_result.to_dict(),
                 "entry": entry}
-    except TranslationError as e:
+    except (TranslationError, PrecisionError) as e:
         catalog.mark_failed(req_id, f"translation: {e}")
         if notify:
             search_mod.notify_line(
-                f"❌ 번역 실패: {query}\n{e}\n— ZAI_API_KEY 또는 GLM-5.2 endpoint 확인"
+                f"❌ 정밀 번역 실패: {query}\n{e}\n"
+                "— 원전 조사·개념 교차검증·GLM endpoint 로그 확인"
             )
         return {"ok": False, "req_id": req_id, "error": str(e)}
     except Exception as e:

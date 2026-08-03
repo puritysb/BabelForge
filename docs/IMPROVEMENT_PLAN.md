@@ -1,5 +1,10 @@
-# Book Translator Pipeline — Full Analysis & Improvement Plan
+# Book Translator Pipeline — Historical Improvement Plan
 # 2026-07-05
+
+> Historical snapshot. The production pipeline now runs mandatory precision
+> source research, structured concept adjudication with adversarial
+> cross-validation, and a fail-closed whole-book terminology audit. See
+> `CLAUDE.md` for the current architecture.
 
 ## Current Architecture
 

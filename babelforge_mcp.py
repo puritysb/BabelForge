@@ -5,7 +5,7 @@ gateway). Instead of teaching each agent to shell out to search.py / start.sh
 and parse JSONL, it exposes four tools over MCP:
 
     search_books(query)      → candidate list  (pick one)
-    translate_book(candidate)→ req_id, returns immediately (runs detached ~1-2h)
+    translate_book(candidate)→ req_id, returns immediately (runs detached)
     get_status(req_id?)      → progress / final state
     list_recent(limit)       → recent requests
 
@@ -49,8 +49,10 @@ def search_books(query: str, limit_per_source: int = 5) -> list[dict]:
     with 'annas:' to opt into Anna's Archive (copyright is the user's
     responsibility), or pass a local file path to ingest a file you own.
 
-    Returns a list of candidate dicts. Show them to the user, let them pick one,
-    then pass that exact dict to translate_book().
+    Returns a list of candidate dicts including source language. Show them to
+    the user and let them pick one. The mandatory precision preflight may
+    autonomously replace a relay translation with a verified public-domain
+    original-language edition before translating.
     """
     cands = search_mod.search_all(query, limit_per_source=limit_per_source)
     return [_candidate_to_dict(c) for c in cands]
@@ -60,11 +62,12 @@ def search_books(query: str, limit_per_source: int = 5) -> list[dict]:
 def translate_book(candidate: dict, notify: bool = True) -> dict:
     """Start translating + publishing a candidate returned by search_books().
 
-    Returns IMMEDIATELY with a req_id; the full pipeline (fetch → extract →
-    auto-glossary → GLM translation → bilingual EPUB → Calibre/OPDS → device
-    push) runs detached in the background and takes ~1-2h for a novel. Poll
-    get_status(req_id) for progress. Translation is checkpointed, so a failed
-    run can be re-started and resumes where it left off.
+    Returns IMMEDIATELY with a req_id; the full precision pipeline (source and
+    original-edition research → concept-sheet web grounding + adversarial
+    cross-check → semantic translation/proofread → fail-closed whole-book audit
+    → EPUB → Calibre/OPDS → device push) runs detached. Poll get_status(req_id)
+    for progress. Translation is checkpointed against both source text and the
+    precision profile, so stale terminology decisions are never reused.
     """
     title = candidate.get("title", "") or "(untitled)"
     req_id = catalog.new_request(title)

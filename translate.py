@@ -9,11 +9,15 @@ API: Zhipu AI (ZAI) OpenAI-compatible chat endpoint.
   - auth:    Bearer $ZAI_API_KEY  (read from env, never hard-coded)
 
 Key design:
+  - Production calls require a researched concept sheet. Its hash and the
+    precision prompt version participate in checkpoint compatibility.
   - One GLM call per batch of ~20 paragraphs. Output is delimited Korean
     paragraphs that we split back into a list aligned 1:1 with the input.
   - Exponential backoff on 429/5xx. After TRANSLATE_MAX_RETRIES we surface a
     TranslationError so the orchestrator can mark the request failed.
   - If $ZAI_API_KEY is unset, we fail fast with a clear actionable message.
+  - A final whole-book terminology audit repairs violations and fails closed if
+    any strict concept remains inconsistent.
 """
 from __future__ import annotations
 import hashlib
@@ -42,6 +46,7 @@ class TranslatedBook:
     title: str
     author: str
     chapters: list[TranslatedChapter] = field(default_factory=list)
+    quality_report: dict | None = None
 
 
 class TranslationError(RuntimeError):
@@ -51,6 +56,7 @@ class TranslationError(RuntimeError):
 # The system prompt is built per-call so the source language can vary
 # (en/fr/ja/…). The marker discipline and 1:1 paragraph mapping stay fixed.
 PARA_DELIM = "⟦P⟧"
+PRECISION_PROMPT_VERSION = "literary-precision-v1"
 
 # ─── HTML Tag Placeholder System ───
 # GLM-5.2 often strips or mangles inline HTML tags (<i>, <b>, <em>, <strong>).
@@ -77,20 +83,55 @@ def _restore_tags(text: str, mapping: dict[str, str]) -> str:
     return text
 
 
-def _system_prompt(source_lang: str, glossary: dict | None = None) -> str:
+def _concept_rules(concept_sheet: dict | None) -> str:
+    if not concept_sheet:
+        return ""
+    rules = []
+    for concept in concept_sheet.get("concepts") or []:
+        forms = ", ".join(repr(str(v)) for v in concept.get("source_terms") or [])
+        target = str(concept.get("canonical_ko") or "").strip()
+        if not forms or not target:
+            continue
+        original = ", ".join(str(v) for v in concept.get("original_terms") or [])
+        avoid = ", ".join(repr(str(v)) for v in concept.get("avoid_ko") or [])
+        rule = f"- {forms} => '{target}'"
+        if original:
+            rule += f" (underlying original: {original})"
+        if avoid:
+            rule += f"; never use {avoid} for this concept"
+        rationale = str(concept.get("rationale") or "").strip()
+        if rationale:
+            rule += f"; distinction: {rationale}"
+        if not concept.get("strict", True):
+            rule += "; contextual term—use the mapping only in the documented sense"
+        rules.append(rule)
+    if not rules:
+        return ""
+    return (
+        "\n\nBook-level Concept Sheet (philologically researched and "
+        "cross-checked; preserve distinctions exactly):\n" + "\n".join(rules)
+    )
+
+
+def _system_prompt(source_lang: str, glossary: dict | None = None,
+                   concept_sheet: dict | None = None) -> str:
     src = {"en": "English", "ja": "Japanese", "fr": "French",
            "de": "German", "zh": "Chinese", "es": "Spanish"}.get(source_lang, source_lang)
     prompt = (
         f"You are a careful literary translator from {src} to Korean.\n"
         "Rules:\n"
-        "1. Translate every input paragraph into natural, publishable Korean.\n"
+        "1. Translate every input paragraph faithfully into natural, publishable Korean. "
+        "Conceptual and logical accuracy outranks surface fluency.\n"
         "2. Preserve the exact paragraph count and order: one output paragraph per "
         f"input paragraph, separated by the marker {PARA_DELIM} on its own line.\n"
         "3. Do NOT add commentary, notes, or summaries.\n"
         "4. Keep dialogue dashes, emphasis, and paragraph breaks as in the source.\n"
         "5. If a paragraph is a chapter heading or pure punctuation, translate it "
         "as a short heading-style line and still emit the marker after it.\n"
-        f"6. Output ONLY the Korean paragraphs separated by {PARA_DELIM}. No preamble."
+        f"6. Output ONLY the Korean paragraphs separated by {PARA_DELIM}. No preamble.\n"
+        "7. Preserve negation, modality, contrasts, causal relations, metaphors, "
+        "and distinctions between neighboring technical terms. Never silently "
+        "generalize or beautify a difficult claim."
     )
     if glossary:
         rules = []
@@ -102,6 +143,7 @@ def _system_prompt(source_lang: str, glossary: dict | None = None) -> str:
                 rules.append(f"- '{src_word}' must be translated as '{tgt_word}'")
         glossary_txt = "\n".join(rules)
         prompt += f"\n\nTerminology Glossary (strictly respect these mappings):\n{glossary_txt}"
+    prompt += _concept_rules(concept_sheet)
     return prompt
 
 
@@ -195,7 +237,9 @@ def _parse_numbered_slots(raw: str, n: int) -> list[str]:
     return slots
 
 
-def _translate_one(paragraph: str, source_lang: str = "en", glossary: dict | None = None) -> str:
+def _translate_one(paragraph: str, source_lang: str = "en",
+                   glossary: dict | None = None,
+                   concept_sheet: dict | None = None) -> str:
     """Translate a single paragraph. Returns "" on failure (never raises).
 
     Used as a fallback when a batch is under-returned — single-paragraph calls
@@ -205,7 +249,8 @@ def _translate_one(paragraph: str, source_lang: str = "en", glossary: dict | Non
     stashed, tag_map = _stash_tags(paragraph)
     try:
         out = _chat([
-            {"role": "system", "content": _system_prompt(source_lang, glossary)},
+            {"role": "system", "content": _system_prompt(
+                source_lang, glossary, concept_sheet)},
             {"role": "user", "content": (
                 f"Translate this single {source_lang} paragraph into Korean. "
                 f"Emit exactly one Korean paragraph (no markers, no numbering):\n\n{stashed}"
@@ -224,16 +269,19 @@ def _translate_one(paragraph: str, source_lang: str = "en", glossary: dict | Non
 
 
 
-def _proofread_batch(originals: list[str], translations: list[str], source_lang: str, glossary: dict | None = None) -> list[str]:
-    """Compare draft translations to originals and polish them via a second LLM pass."""
+def _proofread_batch(originals: list[str], translations: list[str],
+                     source_lang: str, glossary: dict | None = None,
+                     concept_sheet: dict | None = None) -> list[str]:
+    """Semantic accuracy review followed by restrained literary polishing."""
     n = len(originals)
     src_name = {"en": "English", "ja": "Japanese", "fr": "French",
                 "de": "German", "zh": "Chinese", "es": "Spanish"}.get(source_lang, source_lang)
     
     system_prompt = (
-        f"You are a rigorous, professional literary editor. Compare the original {src_name} paragraphs "
-        "with their Korean translations to correct any translation errors, omissions, awkward phrasing, "
-        "or unnatural Korean structures.\n\n"
+        f"You are a rigorous bilingual philological editor. Compare the original {src_name} paragraphs "
+        "with their Korean drafts. First correct semantic errors: mistranslated concepts, logical "
+        "relations, negation, modality, referents, omissions, and unjustified paraphrase. Only then "
+        "polish awkward Korean without weakening or beautifying the claim.\n\n"
         "Rules:\n"
         "1. Generate polished, natural literary Korean translations.\n"
         f"2. Keep the exact paragraph count and order: output exactly {n} Korean "
@@ -251,6 +299,7 @@ def _proofread_batch(originals: list[str], translations: list[str], source_lang:
                 rules.append(f"- '{src_word}' must be translated as '{tgt_word}'")
         glossary_txt = "\n".join(rules)
         system_prompt += f"\n\nGlossary (ensure these are applied):\n{glossary_txt}"
+    system_prompt += _concept_rules(concept_sheet)
 
     # Stash HTML tags before the proofreading pass too — this second pass
     # rewrites the Korean, so raw <i>/<b>/… would be just as vulnerable to
@@ -304,7 +353,8 @@ def _proofread_batch(originals: list[str], translations: list[str], source_lang:
 
 def _translate_batch(paragraphs: list[str], source_lang: str = "en",
                         glossary: dict | None = None,
-                        context_before: list[str] | None = None) -> list[str]:
+                        context_before: list[str] | None = None,
+                        concept_sheet: dict | None = None) -> list[str]:
     """Translate a batch of source paragraphs -> list of Korean paragraphs.
 
     The model is told to emit exactly len(paragraphs) chunks separated by the
@@ -354,7 +404,8 @@ def _translate_batch(paragraphs: list[str], source_lang: str = "en",
         f"{context_block}\n\n{numbered}"
     )
     raw = _chat([
-        {"role": "system", "content": _system_prompt(source_lang, glossary)},
+        {"role": "system", "content": _system_prompt(
+            source_lang, glossary, concept_sheet)},
         {"role": "user", "content": user_msg},
     ])
     # Align by the [k] markers (robust to a dropped ⟦P⟧). Slots hold raw model
@@ -376,11 +427,11 @@ def _translate_batch(paragraphs: list[str], source_lang: str = "en",
         )
         for i in missing:
             slots[i] = _translate_one(paragraphs[i], source_lang=source_lang,
-                                      glossary=glossary)
+                                      glossary=glossary,
+                                      concept_sheet=concept_sheet)
 
-    if config.TWO_PASS_TRANSLATION:
-        return _proofread_batch(paragraphs, slots, source_lang, glossary)
-    return slots
+    return _proofread_batch(paragraphs, slots, source_lang, glossary,
+                            concept_sheet)
 
 
 
@@ -409,7 +460,8 @@ def translate_book(title: str, author: str, chapters: list[Chapter],
                    progress_cb=None, source_lang: str = "en",
                    checkpoint_path: str | None = None,
                    max_workers: int | None = None,
-                   glossary: dict | None = None) -> TranslatedBook:
+                   glossary: dict | None = None,
+                   concept_sheet: dict | None = None) -> TranslatedBook:
     """Translate every chapter, paragraph-batched, concurrently.
 
     progress_cb(done_paragraphs, total_paragraphs) is called periodically so
@@ -426,12 +478,20 @@ def translate_book(title: str, author: str, chapters: list[Chapter],
         Default: config.TRANSLATE_WORKERS.
     glossary: optional dictionary of term mappings. If not provided, attempts to
         load a default glossary from config.GLOSSARY_PATH.
+    concept_sheet: mandatory in the production precision pipeline. Its profile
+        hash is part of checkpoint compatibility, so changing a researched term
+        never silently reuses translations made under the old decision.
 
     Batches run concurrently and are integrated into per-chapter pair storage
     as they complete (out of order). The checkpoint is flushed every 30 batches
     or 60s, so a crash never loses more than ~a minute of work.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if concept_sheet is None:
+        raise TranslationError(
+            "precision translation requires an autonomously researched concept sheet"
+        )
 
     # Load default glossary if none provided
     if glossary is None and os.path.isfile(config.GLOSSARY_PATH):
@@ -448,14 +508,18 @@ def translate_book(title: str, author: str, chapters: list[Chapter],
     max_workers = max_workers or config.TRANSLATE_WORKERS
     total = sum(len(c.paragraphs) for c in chapters)
     fp = _source_fingerprint(chapters)
+    quality_fp = _quality_profile_fingerprint(concept_sheet)
 
     # Resume from checkpoint: rebuild per-chapter pair lists so we can skip
     # every batch that already has a translation.
     resumed: dict[int, list[list[str]]] = {}
     if checkpoint_path and os.path.isfile(checkpoint_path):
         try:
-            ckpt = json.load(open(checkpoint_path, "r", encoding="utf-8"))
-            if ckpt.get("source_hash") == fp and len(ckpt.get("chapters", [])) == len(chapters):
+            with open(checkpoint_path, "r", encoding="utf-8") as f:
+                ckpt = json.load(f)
+            if (ckpt.get("source_hash") == fp
+                    and ckpt.get("quality_profile_hash") == quality_fp
+                    and len(ckpt.get("chapters", [])) == len(chapters)):
                 for ci, c in enumerate(ckpt["chapters"]):
                     resumed[ci] = [list(p) for p in c.get("pairs", [])]
                 done = sum(len(v) for v in resumed.values())
@@ -465,7 +529,7 @@ def translate_book(title: str, author: str, chapters: list[Chapter],
                 )
             else:
                 sys.stderr.write(
-                    "[translate] checkpoint ignored (source mismatch) — "
+                    "[translate] checkpoint ignored (source/precision profile mismatch) — "
                     "starting fresh\n"
                 )
         except (json.JSONDecodeError, OSError) as e:
@@ -539,7 +603,8 @@ def translate_book(title: str, author: str, chapters: list[Chapter],
         now = time.time()
         if checkpoint_path and (done_batches % 30 == 0 or now - last_ckpt > 60):
             _flush_checkpoint(checkpoint_path, title, author, fp,
-                              source_lang, chapters, chapter_pairs)
+                              source_lang, chapters, chapter_pairs,
+                              quality_profile_hash=quality_fp)
             last_ckpt = now
             if progress_cb:
                 progress_cb(_count_done(chapter_pairs), total)
@@ -551,7 +616,7 @@ def translate_book(title: str, author: str, chapters: list[Chapter],
                 # Preceding source paragraphs (same chapter) as context.
                 context_before = chapters[ci].paragraphs[max(0, i - 3):i] or None
                 fut = ex.submit(_translate_batch, window, source_lang,
-                                glossary, context_before)
+                                glossary, context_before, concept_sheet)
                 futs[fut] = (ci, i, window)
             for fut in as_completed(futs):
                 ci, i, window = futs[fut]
@@ -568,7 +633,8 @@ def translate_book(title: str, author: str, chapters: list[Chapter],
     # Final flush + assemble the TranslatedBook in chapter order.
     if checkpoint_path:
         _flush_checkpoint(checkpoint_path, title, author, fp,
-                          source_lang, chapters, chapter_pairs)
+                          source_lang, chapters, chapter_pairs,
+                          quality_profile_hash=quality_fp)
     if progress_cb:
         progress_cb(_count_done(chapter_pairs), total)
 
@@ -608,6 +674,22 @@ def translate_book(title: str, author: str, chapters: list[Chapter],
             f"publish incomplete EPUB ({preview}{extra}). Checkpoint kept at "
             f"{checkpoint_path}; fill blanks and rerun."
         )
+
+    # Precision mode is fail-closed: enforce every strict book-level concept
+    # over the assembled translation, repair violations in context, then verify
+    # again before the EPUB can reach the assembler/publisher.
+    from quality_audit import QualityAuditError, audit_and_correct
+    try:
+        book.quality_report = audit_and_correct(book, concept_sheet or {}, _chat)
+    except QualityAuditError as exc:
+        raise TranslationError(f"quality audit failed: {exc}") from exc
+
+    # Persist any audit corrections. This keeps resume monotonic while ensuring
+    # the checkpoint represents the exact quality profile that produced it.
+    if checkpoint_path:
+        _save_checkpoint(checkpoint_path, title, author, fp, source_lang,
+                         book.chapters, quality_profile_hash=quality_fp,
+                         quality_report=book.quality_report)
     return book
 
 
@@ -619,12 +701,26 @@ def _count_done(chapter_pairs: dict[int, list[list[str]]]) -> int:
 
 def _flush_checkpoint(path: str, title: str, author: str, source_hash: str,
                       source_lang: str, chapters: list[Chapter],
-                      chapter_pairs: dict[int, list[list[str]]]) -> None:
+                      chapter_pairs: dict[int, list[list[str]]],
+                      quality_profile_hash: str | None = None) -> None:
     """Persist current translation state from the pair storage."""
     tchs = [TranslatedChapter(title=ch.title,
                               pairs=[(p[0], p[1]) for p in chapter_pairs[ci]])
             for ci, ch in enumerate(chapters)]
-    _save_checkpoint(path, title, author, source_hash, source_lang, tchs)
+    _save_checkpoint(path, title, author, source_hash, source_lang, tchs,
+                     quality_profile_hash=quality_profile_hash)
+
+
+def _quality_profile_fingerprint(concept_sheet: dict | None) -> str:
+    data = {
+        "prompt_version": PRECISION_PROMPT_VERSION,
+        "model": config.ZAI_MODEL,
+        "concept_profile": (concept_sheet or {}).get("profile_hash"),
+        "concepts": (concept_sheet or {}).get("concepts") or [],
+    }
+    raw = json.dumps(data, ensure_ascii=False, sort_keys=True,
+                     separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _source_fingerprint(chapters: list[Chapter]) -> str:
@@ -643,16 +739,21 @@ def _source_fingerprint(chapters: list[Chapter]) -> str:
 
 def _save_checkpoint(path: str, title: str, author: str, source_hash: str,
                      source_lang: str, chapters: list[TranslatedChapter],
-                     partial: tuple[int, int] | None = None) -> None:
+                     partial: tuple[int, int] | None = None,
+                     quality_profile_hash: str | None = None,
+                     quality_report: dict | None = None) -> None:
     """Atomically write the translation checkpoint."""
     data = {
         "title": title,
         "author": author,
         "source_hash": source_hash,
         "source_lang": source_lang,
+        "quality_profile_hash": quality_profile_hash,
         "chapters": [{"title": c.title, "pairs": [list(p) for p in c.pairs]}
                      for c in chapters],
     }
+    if quality_report is not None:
+        data["quality_report"] = quality_report
     if partial is not None:
         data["partial_chapter"], data["partial_unit"] = partial
     d = os.path.dirname(path)
@@ -679,10 +780,13 @@ def main():
     payload = json.loads(sys.stdin.read())
     chapters = [Chapter(title=c["title"], paragraphs=c["paragraphs"])
                 for c in payload["chapters"]]
-    book = translate_book(payload["title"], payload["author"], chapters)
+    book = translate_book(payload["title"], payload["author"], chapters,
+                          concept_sheet=payload.get("concept_sheet"),
+                          glossary=payload.get("glossary"))
     out = {
         "title": book.title,
         "author": book.author,
+        "quality_report": book.quality_report,
         "chapters": [{"title": c.title, "pairs": c.pairs} for c in book.chapters],
     }
     json.dump(out, sys.stdout, ensure_ascii=False)

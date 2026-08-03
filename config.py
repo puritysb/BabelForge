@@ -36,6 +36,7 @@ CATALOG_PATH = os.path.join(DATA_DIR, "catalog.json")    # request state machine
 ATTEMPTS_PATH = os.path.join(DATA_DIR, "attempts.json")  # book ids we already tried
 PENDING_PUSH_PATH = os.path.join(DATA_DIR, "pending-push.json")  # auto-push queue
 CHECKPOINT_DIR = os.path.join(DATA_DIR, "checkpoints")   # translation resume state
+CONCEPT_DIR = os.path.join(DATA_DIR, "concepts")         # per-request precision research
 
 VENV_PYTHON = os.path.join(BASE_DIR, "venv", "bin", "python3")
 
@@ -134,23 +135,15 @@ BILINGUAL_SUFFIX = "(KO bilingual)"
 SOURCE_LANG = "en"
 TRANSLATION_LANG = "ko"
 
-# ─── Translation Quality Improvements ───
-TWO_PASS_TRANSLATION = True  # Enable 2-Pass (Draft + Proofread) translation
-GLOSSARY_PATH = os.path.join(DATA_DIR, "glossary.json")  # Terminology glossary path
-# Auto-glossary: pipeline.py extracts recurring proper nouns/terms before
-# translation and (when GLOSSARY_ENRICH) asks GLM for their canonical Korean
-# rendering, so a name/place is translated the same way across all concurrent workers.
-# Enrichment costs one extra GLM call per book; on the z.ai Coding Plan that's
-# negligible and it clearly lifts terminology consistency, so default ON.
-GLOSSARY_ENABLED = True
-GLOSSARY_ENRICH = True
-# When GLOSSARY_WEB_SEARCH, enrichment first web-searches the top terms via the
-# Z.ai web_search_prime MCP tool (see mcp_client.py) and grounds GLM's Korean
-# renderings in real published usage instead of letting it guess — the whole
-# point of a glossary is the *established* rendering of a name/place. Bounded to
-# the GLOSSARY_WEB_SEARCH_TERMS most frequent terms to keep it to a few calls.
-GLOSSARY_WEB_SEARCH = True
-GLOSSARY_WEB_SEARCH_TERMS = 8
+# ─── Mandatory precision translation ───
+# There is deliberately no "fast" mode. Every book gets bibliographic source
+# research, original-language replacement when a public-domain edition can be
+# resolved, web-grounded concept adjudication, an adversarial terminology
+# cross-check, semantic proofreading, and a fail-closed final audit.
+# Kept for the standalone translate.py compatibility path. The production
+# pipeline writes request-scoped structured sheets under CONCEPT_DIR and passes
+# their flattened mappings explicitly, so concurrent books never share this.
+GLOSSARY_PATH = os.path.join(DATA_DIR, "glossary.json")
 
 # ─── Z.ai MCP (Streamable HTTP; same Coding-Plan key as the REST API) ───
 ZAI_MCP_WEB_SEARCH_URL = "https://api.z.ai/api/mcp/web_search_prime/mcp"
@@ -159,7 +152,8 @@ ZAI_MCP_TIMEOUT_S = 60
 
 
 def ensure_dirs():
-    for d in (DATA_DIR, LIBRARY_DIR, CACHE_DIR, LOGS_DIR, CHECKPOINT_DIR):
+    for d in (DATA_DIR, LIBRARY_DIR, CACHE_DIR, LOGS_DIR, CHECKPOINT_DIR,
+              CONCEPT_DIR):
         os.makedirs(d, exist_ok=True)
 
 
