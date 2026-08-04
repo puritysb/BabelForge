@@ -49,7 +49,7 @@ BabelForge is a self-contained Python project, but it leans on four things outsi
 |---|---|---|
 | **`crosspoint-agentdeck`** repo (sibling checkout at `~/github/crosspoint-agentdeck`) | The **bilingual-EPUB format is defined there** — `docs/bilingual-epub.md` is the SSOT; `assemble.py`'s skeleton derives from its `scripts/generate_bilingual_test_epub.py`, and `build_font.py` reads its `lib/EpdFont/scripts`. | Producer↔consumer format contract. The reader firmware is the consumer; this pipeline is the producer. Changes are breaking on both sides — see that repo's `docs/bilingual-epub.md`. |
 | **`openclaw` CLI** (`/opt/homebrew/bin/openclaw`) | LINE notifications (`search.py`, `config.py:OPENCLAW_BIN`). | A single `openclaw message send` subprocess call. No code dependency. |
-| **Calibre Content Server** (launchd `com.local.calibre-server`, port 8080) | Hosts the OPDS feed at `books.foundby.kr/opds` (cloudflared → localhost:8080). `publish.py` only calls `calibredb add`. The older `books.getlingo.store` route may still exist as a compatibility alias, but generated BabelForge links use `books.foundby.kr`. | External service. |
+| **Calibre Content Server** (launchd `com.local.calibre-server`, port 8080) | Hosts the OPDS feed at `books.foundby.kr/opds` (cloudflared → localhost:8080). `publish.py` only calls `calibredb add`. The older `books.getlingo.store` route still exists as a compatibility alias, but **that domain is due to expire** — generated BabelForge links use `books.foundby.kr`. | External service. |
 | **ZAI / GLM API** (`api.z.ai`) | Translation engine. Key from `.env` (`ZAI_API_KEY` / `GLM_API_KEY`) — never committed. | External API. |
 
 ## Automation
