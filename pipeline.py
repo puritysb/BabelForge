@@ -49,7 +49,7 @@ def run(candidate: dict, req_id: str | None = None,
         concept_path = os.path.join(config.CONCEPT_DIR, f"{req_id}.json")
         previous = catalog.get(req_id) or {}
         saved_candidate = previous.get("selected")
-        if (os.path.isfile(concept_path) and isinstance(saved_candidate, dict)
+        if (isinstance(saved_candidate, dict)
                 and isinstance(previous.get("source_research"), dict)):
             cand = Candidate(**{k: v for k, v in saved_candidate.items()
                                 if k != "extra"})
@@ -64,7 +64,7 @@ def run(candidate: dict, req_id: str | None = None,
                                 if k != "extra"})
             cand.extra = candidate.get("extra")
             source_research = research_source(
-                cand, chat_fn=_translate._chat, search_fn=web_search)
+                cand, chat_fn=_translate._chat_json, search_fn=web_search)
 
             def _search_original(q: str):
                 return search_mod.search_all(
@@ -131,7 +131,7 @@ def run(candidate: dict, req_id: str | None = None,
             concept_sheet = build_concept_sheet(
                 chapters=chapters, title=cand.title, author=cand.author,
                 source_lang=source_lang, source_research=source_research,
-                chat_fn=_translate._chat, search_fn=web_search)
+                chat_fn=_translate._chat_json, search_fn=web_search)
             persist_concept_sheet(concept_path, concept_sheet)
         glossary = flat_glossary(concept_sheet)
         catalog.update(req_id, status="translating",

@@ -102,4 +102,9 @@ def get(req_id: str) -> Optional[dict]:
 
 def recent(limit: int = 20) -> list[dict]:
     data = _load()
-    return data.get("entries", [])[-limit:][::-1]
+    entries = data.get("entries", [])
+    return sorted(
+        entries,
+        key=lambda e: (e.get("updated_ms") or e.get("created_ms") or 0),
+        reverse=True,
+    )[:limit]

@@ -94,6 +94,52 @@ CHAPTER_RE = re.compile(
     re.MULTILINE,
 )
 
+TOC_LABEL_RE = re.compile(
+    r"^(?:table\s+of\s+contents|contents|inhalt|sommaire|"
+    r"(?:í|i)ndice|目次)\s*\.?$",
+    re.IGNORECASE,
+)
+
+
+def _toc_headings(raw: str) -> set[str]:
+    """Return normalized headings listed in an indented plain-text TOC.
+
+    Gutenberg TXT files often preserve a useful multilingual contents block
+    even when their real section headings are title case rather than ``CHAPTER
+    I`` or all caps.  Nietzsche 7207 is one such file: the old detector found
+    no headings, collapsed the whole book to ``Untitled``, and the device then
+    displayed 37 meaningless safety chunks.  Treating only entries copied from
+    an explicit indented TOC as headings avoids guessing that short aphorisms
+    are chapters.
+    """
+    lines = raw.splitlines()
+    headings: set[str] = set()
+    for index, line in enumerate(lines):
+        if not TOC_LABEL_RE.fullmatch(line.strip()):
+            continue
+        cursor = index + 1
+        while cursor < len(lines) and not lines[cursor].strip():
+            cursor += 1
+        block: list[str] = []
+        while cursor < len(lines):
+            candidate = lines[cursor]
+            if not candidate.strip():
+                break
+            if candidate[:1] not in {" ", "\t"}:
+                break
+            value = re.sub(r"\s+", " ", candidate).strip()
+            if value:
+                block.append(value)
+            cursor += 1
+        # A single indented line is too ambiguous (it may be an epigraph).
+        if len(block) >= 2:
+            headings.update(_heading_key(value) for value in block)
+    return headings
+
+
+def _heading_key(value: str) -> str:
+    return re.sub(r"[.。:：]+$", "", re.sub(r"\s+", " ", value).strip()).casefold()
+
 # Safety cap: never produce a single chapter so large the ESP32-C3 can't
 # reflow it on Bilingual Toggle without an obvious hitch. Each chunk becomes a
 # separate xhtml in the EPUB spine, keeping section cache size bounded.
@@ -159,6 +205,7 @@ def _extract_txt(path: str) -> list[Chapter]:
     # Strip the duplicated "Produced by ... pgdp.net" credits block that often
     # immediately follows the START marker.
     raw = GUTEN_PRODUCED.sub("", raw, count=1)
+    toc_headings = _toc_headings(raw)
 
     # Normalize whitespace into paragraphs (blank-line separated).
     # Collapse runs of whitespace inside a paragraph.
@@ -179,13 +226,15 @@ def _extract_txt(path: str) -> list[Chapter]:
     # the device's TOC. The first heading encountered promotes the bucket.
     current = Chapter(title="Preface")
     for p in paras:
-        first_line = p.split("\n")[0].strip()
-        is_heading = (
-            bool(CHAPTER_RE.match(p))
-            or (len(p) <= 80 and len(p.split()) <= 6 and bool(CHAPTER_RE.match(p)))
-        )
+        from_toc = _heading_key(p) in toc_headings
+        is_heading = bool(CHAPTER_RE.fullmatch(p)) or from_toc
         if is_heading:
             current = Chapter(title=p.strip()[:200])
+            # A TOC-derived title was a normal paragraph in older extraction
+            # output. Keep it as the first bilingual unit so checkpoint source
+            # coverage remains stable while the chapter boundary improves.
+            if from_toc:
+                current.paragraphs.append(p)
             chapters.append(current)
         else:
             current.paragraphs.append(p)

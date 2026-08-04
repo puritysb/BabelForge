@@ -40,7 +40,10 @@ long-presses Confirm to cycle Both → Original only → Translation only.
   analyzing → translating → quality_checked → assembling → published / failed)
 - Calibre library: `~/Calibre-Library/` (served by launchd
   `com.local.calibre-server` on port 8080)
-- Public OPDS: `https://books.foundby.kr/opds` (cloudflared tunnel)
+- Public OPDS: `https://books.foundby.kr/opds` (cloudflared tunnel). X3/X4
+  setup uses `http://books.foundby.kr/opds`: the catalog is public/no-auth and
+  current reader firmware fails the Cloudflare TLS handshake while HTTP serves
+  the same feed without redirecting.
 
 ## How the agent drives it
 
@@ -54,6 +57,9 @@ tools instead of shelling out — no paths, no JSONL parsing:
   pipeline runs in the background. Pass the exact candidate dict the user chose;
   it may autonomously replace a relay translation with a verified public-domain
   original-language edition.
+- `retry_request(req_id)` → resumes a failed request under the same `req_id`,
+  reusing its verified source, concept sheet, and translation checkpoint. This
+  is the normal recovery path and does not require shell execution approval.
 - `get_status(req_id)` → progress %, then `published` (epub_path/opds_url) or
   `failed` (error). A failed run is resumable — re-running continues from its
   checkpoint.
@@ -108,8 +114,15 @@ cd ~/github/BabelForge
    malformed JSON is repaired automatically and no user approval is requested
 5. translates each chapter in 20-paragraph batches through GLM-5.2, with the
    concept sheet and semantic-accuracy proofread applied to every batch
-6. audits every strict concept occurrence across the completed book, repairs
-   violations in context, and refuses publication if any remain
+6. independently reviews every final source/translation pair for semantic
+   errors, omissions, untranslated quotations, and malformed Korean; then
+   audits every strict concept occurrence, repairs violations in context, and
+   refuses publication if any issue remains. A normally
+   forbidden Korean string may remain only when an autonomous contextual review
+   records that it translates a different source lemma in that paragraph; a
+   canonical term may be omitted only when an exact longer source expression
+   proves that the matched spelling is a non-conceptual idiom, never for an
+   exact standalone concept occurrence
 7. assembles the bilingual EPUB (block-level `<p class="cp-original">` +
    `<p class="cp-translation">` pairs — the firmware contract)
 8. `calibredb add` into `~/Calibre-Library/`, tagged
@@ -128,6 +141,20 @@ cd ~/github/BabelForge
 ./venv/bin/python3 -c "import catalog; print(catalog.recent(5))"
 ```
 
+### 4. Recover a failed request
+
+When the MCP status is `failed`, inspect the recorded error and use
+`retry_request(req_id)` for a retry-safe endpoint/structured-output failure.
+Retry automatically at most once for an unchanged failure, then poll the same
+`req_id`. A new retry is allowed after the underlying code or dependency state
+has materially changed and passed validation. Do not create a second request,
+edit production Python files, or fall back to shell commands merely to resume
+the book.
+
+If a shell command unexpectedly requests approval, do not print `/approve`
+yourself; only the user can grant that approval. Continue through the typed MCP
+tools when possible, otherwise report the exact blocked action.
+
 ## Environment requirements
 
 - `ZAI_API_KEY` exported (GLM Coding Plan). Without it, translate.py fails
@@ -141,7 +168,8 @@ cd ~/github/BabelForge
    Settings → Reader → Font Family.
 2. Settings → System → OPDS Servers → Add Server:
    - Name: `OpenClaw Library`
-   - URL: `https://books.foundby.kr/opds`
+   - URL: `http://books.foundby.kr/opds` (the feed is public; HTTP avoids the
+     verified X3/X4 TLS failure while retaining the stable domain)
    - Username/Password: (none — Content Server runs without auth on the tunnel;
      enable Basic auth later if exposing wider)
 3. Settings → Controls → Long-press Menu → cycle to **Bilingual Toggle**
@@ -158,7 +186,8 @@ to switch views.
 - Precision translation is mandatory. There is no fast-mode flag and no
   terminology approval pause; source research and multiple evidence-based
   model passes decide autonomously. Failed research or a remaining strict-term
-  violation blocks publication.
+  violation blocks publication. A final full-book semantic/orthographic pass
+  must also review every pair and rejects untranslated substantive passages.
 - The firmware parser only honors block-level `<p>` cp-original/cp-translation
   classes; the assembler never emits `<span>` markers.
 - ESP32-C3 can't hold two EPUBs in RAM — single-file bilingual only.

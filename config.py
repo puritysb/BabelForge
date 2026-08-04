@@ -74,6 +74,10 @@ TRANSLATE_BATCH_PARAGRAPHS = 20                          # max paragraphs per GL
 # Packing to a char budget keeps output well under the ceiling and improves
 # throughput. Small paragraphs still batch up to TRANSLATE_BATCH_PARAGRAPHS.
 TRANSLATE_BATCH_MAX_CHARS = 2200
+# Independent final semantic audit. Each row returns only a keep/correct
+# verdict, so a dozen pairs remain comfortably inside the structured-output
+# budget while still amortizing whole-book review calls.
+QUALITY_AUDIT_BATCH_PARAGRAPHS = 12
 # 4 retries (backoff 1/2/4/8s = 15s total) wasn't enough headroom during the
 # Nietzsche run — 17 batches exhausted all 4 and still hit 429. Raised so
 # backoff has real room to clear a sustained rate-limit window; this is a

@@ -2,10 +2,11 @@
 
 This is the single front door for agents (Claude Code, Codex, the OpenClaw
 gateway). Instead of teaching each agent to shell out to search.py / start.sh
-and parse JSONL, it exposes four tools over MCP:
+and parse JSONL, it exposes five tools over MCP:
 
     search_books(query)      → candidate list  (pick one)
     translate_book(candidate)→ req_id, returns immediately (runs detached)
+    retry_request(req_id)    → same req_id, resumes failed work
     get_status(req_id?)      → progress / final state
     list_recent(limit)       → recent requests
 
@@ -41,6 +42,37 @@ def _candidate_to_dict(c) -> dict:
     return dataclasses.asdict(c) if dataclasses.is_dataclass(c) else dict(c)
 
 
+def _spawn_pipeline(candidate: dict, req_id: str, notify: bool) -> dict:
+    """Persist input and launch one detached pipeline process for ``req_id``."""
+    config.ensure_dirs()
+    fd, cand_path = tempfile.mkstemp(prefix=f"cand_{req_id}_", suffix=".json",
+                                     dir=config.CACHE_DIR)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(candidate, f, ensure_ascii=False)
+
+    os.makedirs(config.LOGS_DIR, exist_ok=True)
+    log_path = os.path.join(config.LOGS_DIR, f"pipeline.{req_id}.log")
+    argv = [config.VENV_PYTHON, "pipeline.py", cand_path, req_id]
+    if not notify:
+        argv.append("--no-notify")
+    with open(log_path, "a", encoding="utf-8") as logf:
+        process = subprocess.Popen(
+            argv, cwd=config.BASE_DIR, env=os.environ.copy(),
+            stdout=logf, stderr=logf, start_new_session=True,
+            close_fds=True,
+        )
+    catalog.update(req_id, selected=candidate, worker_pid=process.pid,
+                   error=None)
+    return {
+        "req_id": req_id,
+        "status": "translating",
+        "title": candidate.get("title", "") or "(untitled)",
+        "log": log_path,
+        "worker_pid": process.pid,
+        "note": "Running in background — poll get_status(req_id).",
+    }
+
+
 @mcp.tool()
 def search_books(query: str, limit_per_source: int = 5) -> list[dict]:
     """Search public-domain catalogs for a book and return candidate editions.
@@ -71,29 +103,47 @@ def translate_book(candidate: dict, notify: bool = True) -> dict:
     """
     title = candidate.get("title", "") or "(untitled)"
     req_id = catalog.new_request(title)
+    return _spawn_pipeline(candidate, req_id, notify)
 
-    # Persist the candidate for the detached process to read.
-    fd, cand_path = tempfile.mkstemp(prefix=f"cand_{req_id}_", suffix=".json",
-                                     dir=config.CACHE_DIR)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(candidate, f, ensure_ascii=False)
 
-    # Detached spawn — start_new_session so it outlives this server / the client
-    # session. Pass our env (config._load_dotenv has populated GLM_API_KEY) so
-    # the child has the key. Log mirrors the CLI's per-run log convention.
-    os.makedirs(config.LOGS_DIR, exist_ok=True)
-    log_path = os.path.join(config.LOGS_DIR, f"pipeline.{req_id}.log")
-    argv = [config.VENV_PYTHON, "pipeline.py", cand_path, req_id]
-    if not notify:
-        argv.append("--no-notify")
-    logf = open(log_path, "a", encoding="utf-8")
-    subprocess.Popen(argv, cwd=config.BASE_DIR, env=os.environ.copy(),
-                     stdout=logf, stderr=logf, start_new_session=True,
-                     close_fds=True)
+@mcp.tool()
+def retry_request(req_id: str, notify: bool = True) -> dict:
+    """Resume one failed translation using the same request and checkpoints.
 
-    return {"req_id": req_id, "status": "translating", "title": title,
-            "log": log_path,
-            "note": "Running in background — poll get_status(req_id)."}
+    This is the approval-free recovery path for agents. It deliberately accepts
+    only a terminal failed request so an agent cannot accidentally start two
+    writers for the same checkpoint. Source resolution, concept sheets, and
+    translated batches already persisted under ``req_id`` are reused.
+    """
+    record = catalog.get(req_id)
+    if not record:
+        return {"error": f"no request with id {req_id!r}"}
+    if record.get("status") != "failed":
+        return {
+            "error": "only failed requests can be retried",
+            "req_id": req_id,
+            "status": record.get("status"),
+        }
+    candidate = record.get("selected")
+    if not isinstance(candidate, dict):
+        return {
+            "error": "failed request has no persisted candidate",
+            "req_id": req_id,
+        }
+    catalog.update(
+        req_id,
+        status="requested",
+        error=None,
+        progress=None,
+        concept_sheet_path=None,
+        concepts=None,
+        precision_profile=None,
+        quality_report=None,
+        retry_count=int(record.get("retry_count") or 0) + 1,
+    )
+    result = _spawn_pipeline(candidate, req_id, notify)
+    result["status"] = "retrying"
+    return result
 
 
 @mcp.tool()

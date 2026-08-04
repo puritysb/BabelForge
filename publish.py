@@ -100,11 +100,13 @@ def _set_comment(book_id: int, comment: str) -> None:
 
 
 def opds_url_for(book_id: int) -> str:
-    """The acquisition entry URL on our public Content Server."""
-    # Calibre's OPDS exposes /opds/book/<id>; the acquisition link points at
-    # /opds/book/<id>/file?fmt=epub. We return the book page so the device's
-    # browser can render the entry and download from there.
-    return f"{config.OPDS_BASE_URL}/opds/book/{book_id}"
+    """Return a verified Calibre Content Server EPUB acquisition URL.
+
+    Current Calibre versions do not expose the historical ``/opds/book/<id>``
+    route (it returns 404). OPDS feeds themselves remain rooted at ``/opds``;
+    the stable acquisition target advertised by the server is ``/get/EPUB/N``.
+    """
+    return f"{config.OPDS_BASE_URL}/get/EPUB/{book_id}"
 
 
 def publish(epub_path: str, title: str, author: str,

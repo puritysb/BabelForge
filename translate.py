@@ -20,6 +20,7 @@ Key design:
     any strict concept remains inconsistent.
 """
 from __future__ import annotations
+import difflib
 import hashlib
 import json
 import os
@@ -56,7 +57,7 @@ class TranslationError(RuntimeError):
 # The system prompt is built per-call so the source language can vary
 # (en/fr/ja/…). The marker discipline and 1:1 paragraph mapping stay fixed.
 PARA_DELIM = "⟦P⟧"
-PRECISION_PROMPT_VERSION = "literary-precision-v1"
+PRECISION_PROMPT_VERSION = "literary-precision-v2"
 
 # ─── HTML Tag Placeholder System ───
 # GLM-5.2 often strips or mangles inline HTML tags (<i>, <b>, <em>, <strong>).
@@ -147,8 +148,48 @@ def _system_prompt(source_lang: str, glossary: dict | None = None,
     return prompt
 
 
-def _chat(messages: list[dict], timeout: int = config.TRANSLATE_TIMEOUT_S) -> str:
-    """POST /chat/completions; return the assistant content string."""
+def _validate_messages(messages: list[dict]) -> list[dict]:
+    """Return a clean text-only message list or fail before calling Z.ai.
+
+    Z.ai business error 1213 means a required field was not received properly.
+    Catching empty/non-text content locally prevents an empty malformed-output
+    repair from being sent as a seemingly valid chat request.
+    """
+    if not isinstance(messages, list) or not messages:
+        raise TranslationError("Z.ai request requires at least one message")
+    clean: list[dict] = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise TranslationError(f"Z.ai message {index} must be an object")
+        role = message.get("role")
+        content = message.get("content")
+        if role not in {"system", "user", "assistant"}:
+            raise TranslationError(f"Z.ai message {index} has invalid role {role!r}")
+        if not isinstance(content, str) or not content.strip():
+            raise TranslationError(
+                f"Z.ai message {index} has empty or non-text content"
+            )
+        clean.append({"role": role, "content": content})
+    return clean
+
+
+def _error_payload(body_text: bytes) -> tuple[str | None, str]:
+    try:
+        payload = json.loads(body_text.decode("utf-8", errors="replace"))
+        error = payload.get("error") or {}
+        return str(error.get("code") or "") or None, str(error.get("message") or "")
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return None, body_text.decode("utf-8", errors="replace")[:200]
+
+
+def _chat(messages: list[dict], timeout: int = config.TRANSLATE_TIMEOUT_S,
+          json_mode: bool = False) -> str:
+    """POST /chat/completions; return non-empty assistant text.
+
+    ``json_mode`` uses Z.ai's documented structured-output contract. Parameter
+    errors such as business code 1213 are not retried with the same invalid
+    body; callers can instead rebuild a valid request with different content.
+    """
     api_key = config.get_zai_api_key()
     if not api_key:
         raise TranslationError(
@@ -157,12 +198,21 @@ def _chat(messages: list[dict], timeout: int = config.TRANSLATE_TIMEOUT_S) -> st
             f"  export {config.ZAI_API_KEY_ENV}=$(openclaw config get …)\n"
             f"or paste the GLM Coding Plan key into the environment."
         )
-    body = json.dumps({
+    payload = {
         "model": config.ZAI_MODEL,
-        "messages": messages,
+        "messages": _validate_messages(messages),
         "max_tokens": config.ZAI_MAX_TOKENS,
         "temperature": 0.3,
-    }).encode("utf-8")
+        # The Coding Plan endpoint enables thinking by default. These calls are
+        # bounded transformations (draft, bilingual proofread, or JSON schema),
+        # and a separate proofread pass already provides semantic review. Hidden
+        # reasoning otherwise consumes the full output budget and can leave the
+        # actual translation empty with finish_reason=length.
+        "thinking": {"type": "disabled"},
+    }
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     last_err = None
     for attempt in range(config.TRANSLATE_MAX_RETRIES):
         # Re-create Request each attempt: defensive against any internal
@@ -173,27 +223,55 @@ def _chat(messages: list[dict], timeout: int = config.TRANSLATE_TIMEOUT_S) -> st
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
+                "Accept-Language": "en-US,en",
             },
             method="POST",
         )
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-                return data["choices"][0]["message"]["content"]
+                choice = data["choices"][0]
+                content = choice["message"].get("content")
+                if not isinstance(content, str) or not content.strip():
+                    finish = choice.get("finish_reason") or "unknown"
+                    reasoning = choice["message"].get("reasoning_content") or ""
+                    raise TranslationError(
+                        f"Z.ai returned empty assistant content "
+                        f"(finish_reason={finish}, reasoning_chars={len(reasoning)})"
+                    )
+                return content
         except urllib.error.HTTPError as e:
             last_err = e
+            body_text = b""
+            try:
+                body_text = e.read()[:400]
+            except Exception:
+                pass
+            business_code, error_message = _error_payload(body_text)
             if e.code in (429, 500, 502, 503, 504):
                 wait = 2 ** attempt
-                sys.stderr.write(f"[translate] HTTP {e.code}, retry in {wait}s\n")
+                sys.stderr.write(
+                    f"[translate] HTTP {e.code}, retry in {wait}s "
+                    f"(business_code={business_code or 'none'})\n"
+                )
                 time.sleep(wait)
                 continue
-            raise TranslationError(f"HTTP {e.code}: {e.read()[:200]!r}") from e
+            raise TranslationError(
+                f"Z.ai HTTP {e.code} business_code={business_code or 'unknown'}: "
+                f"{error_message or 'parameter error'}"
+            ) from e
         except urllib.error.URLError as e:
             last_err = e
             wait = 2 ** attempt
             sys.stderr.write(f"[translate] URLError {e}, retry in {wait}s\n")
             time.sleep(wait)
     raise TranslationError(f"exhausted retries: {last_err}")
+
+
+def _chat_json(messages: list[dict],
+               timeout: int = config.TRANSLATE_TIMEOUT_S) -> str:
+    """Call GLM with the provider's native JSON-object response contract."""
+    return _chat(messages, timeout=timeout, json_mode=True)
 
 
 # Match a "[k] text..." block: the number at line start, then everything up to
@@ -456,6 +534,69 @@ def _plan_windows(paragraphs: list[str], max_paras: int, max_chars: int) -> list
     return windows
 
 
+def _remap_structural_checkpoint(
+        checkpoint: dict, chapters: list[Chapter], title: str, author: str,
+        source_lang: str, minimum_coverage: float = 0.95,
+        ) -> dict[int, list[list[str]]] | None:
+    """Reuse translations when only chapter boundaries/boilerplate changed.
+
+    A better extractor can turn one ``Untitled`` chapter into real sections
+    without changing the underlying prose.  The strict source hash correctly
+    rejects that checkpoint, but translating the whole book again would waste
+    the already aligned work.  Recover only exact, in-order source strings and
+    only when they cover almost the entire newly extracted book.  The normal
+    whole-book semantic and terminology audits still run afterward, so an old
+    draft cannot bypass the current quality profile.
+    """
+    if (checkpoint.get("title") != title
+            or checkpoint.get("author") != author
+            or checkpoint.get("source_lang") != source_lang):
+        return None
+    old_pairs = [
+        list(pair)
+        for chapter in checkpoint.get("chapters") or []
+        for pair in chapter.get("pairs") or []
+        if isinstance(pair, (list, tuple)) and len(pair) >= 2
+    ]
+    new_positions = [
+        (ci, pi, paragraph)
+        for ci, chapter in enumerate(chapters)
+        for pi, paragraph in enumerate(chapter.paragraphs)
+    ]
+    if not old_pairs or not new_positions:
+        return None
+    def source_key(value: str) -> str:
+        # Extractor upgrades may collapse Gutenberg's hard-wrapped lines while
+        # leaving the actual words unchanged. Whitespace normalization is safe
+        # here because recovered pairs still retain the newly extracted source.
+        return re.sub(r"\s+", " ", str(value)).strip()
+
+    old_keys = [source_key(pair[0]) for pair in old_pairs]
+    new_keys = [source_key(position[2]) for position in new_positions]
+    matcher = difflib.SequenceMatcher(
+        a=old_keys,
+        b=new_keys,
+        autojunk=False,
+    )
+    recovered: dict[int, list[list[str]]] = {
+        ci: [[paragraph, ""] for paragraph in chapter.paragraphs]
+        for ci, chapter in enumerate(chapters)
+    }
+    matched = 0
+    for block in matcher.get_matching_blocks():
+        for offset in range(block.size):
+            old_pair = old_pairs[block.a + offset]
+            ci, pi, source = new_positions[block.b + offset]
+            if (old_keys[block.a + offset] == source_key(source)
+                    and str(old_pair[1]).strip()):
+                recovered[ci][pi][1] = str(old_pair[1])
+                matched += 1
+    coverage = matched / len(new_positions)
+    if coverage < minimum_coverage:
+        return None
+    return recovered
+
+
 def translate_book(title: str, author: str, chapters: list[Chapter],
                    progress_cb=None, source_lang: str = "en",
                    checkpoint_path: str | None = None,
@@ -528,10 +669,24 @@ def translate_book(title: str, author: str, chapters: list[Chapter],
                     f"already translated\n"
                 )
             else:
-                sys.stderr.write(
-                    "[translate] checkpoint ignored (source/precision profile mismatch) — "
-                    "starting fresh\n"
-                )
+                remapped = _remap_structural_checkpoint(
+                    ckpt, chapters, title, author, source_lang)
+                if remapped is not None:
+                    resumed = remapped
+                    done = sum(
+                        1 for pairs in resumed.values()
+                        for _, korean in pairs if korean.strip()
+                    )
+                    sys.stderr.write(
+                        f"[translate] remapped structural checkpoint: "
+                        f"{done}/{total} exact source units reused; current "
+                        "quality audits will run\n"
+                    )
+                else:
+                    sys.stderr.write(
+                        "[translate] checkpoint ignored (source/precision "
+                        "profile mismatch) — starting fresh\n"
+                    )
         except (json.JSONDecodeError, OSError) as e:
             sys.stderr.write(f"[translate] checkpoint unreadable ({e}), fresh start\n")
 
@@ -675,12 +830,20 @@ def translate_book(title: str, author: str, chapters: list[Chapter],
             f"{checkpoint_path}; fill blanks and rerun."
         )
 
-    # Precision mode is fail-closed: enforce every strict book-level concept
-    # over the assembled translation, repair violations in context, then verify
-    # again before the EPUB can reach the assembler/publisher.
-    from quality_audit import QualityAuditError, audit_and_correct
+    # Precision mode is fail-closed. First independently review every final
+    # source/translation pair for semantic, omission, and Korean-form errors;
+    # then enforce every strict book-level concept over any corrected text.
+    from quality_audit import (QualityAuditError, audit_and_correct,
+                               audit_translation_quality)
     try:
-        book.quality_report = audit_and_correct(book, concept_sheet or {}, _chat)
+        semantic_report = audit_translation_quality(
+            book, _chat_json,
+            chunk_size=config.QUALITY_AUDIT_BATCH_PARAGRAPHS,
+        )
+        terminology_report = audit_and_correct(
+            book, concept_sheet or {}, _chat_json
+        )
+        book.quality_report = {**terminology_report, **semantic_report}
     except QualityAuditError as exc:
         raise TranslationError(f"quality audit failed: {exc}") from exc
 

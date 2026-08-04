@@ -17,7 +17,8 @@ request → search (Gutenberg / Standard Ebooks / Anna's / local)
           → Korean adjudication → adversarial cross-check → schema normalization)
         → GLM precision translation (paragraph-aligned, batched, semantic
           proofread, HTML-tag preserving, concept-sheet + source-context aware)
-        → fail-closed whole-book terminology audit and contextual repair
+        → fail-closed whole-book semantic/orthographic review, then terminology
+          audit and contextual repair
         → assemble bilingual EPUB (cp-original / cp-translation markers)
         → publish: calibredb add → Calibre Content Server OPDS feed
         → best-effort HTTP push to the XTeink e-ink reader
@@ -32,8 +33,9 @@ the tree is relocatable). Entry points: `run_request.sh` (full pipeline), `start
 
 BabelForge is a self-hosted appliance; agents drive it through the **`babelforge` MCP server**
 (`babelforge_mcp.py`) rather than the CLI. It runs streamable-HTTP under launchd
-(`com.local.babelforge-mcp`, `http://127.0.0.1:8770/mcp`) and exposes four tools:
-`search_books`, `translate_book` (returns a `req_id`; the pipeline runs detached), `get_status`,
+(`com.local.babelforge-mcp`, `http://127.0.0.1:8770/mcp`) and exposes five tools:
+`search_books`, `translate_book` (returns a `req_id`; the pipeline runs detached),
+`retry_request` (resumes a failed request with the same checkpoints), `get_status`, and
 `list_recent`. Deploy: `cp deploy/com.local.babelforge-mcp.plist ~/Library/LaunchAgents/ &&
 launchctl load -w ~/Library/LaunchAgents/com.local.babelforge-mcp.plist`. Register the URL in
 your MCP client (repo `.mcp.json` for Claude Code; `openclaw mcp add`). The CLI below remains a
@@ -108,6 +110,8 @@ tail -f logs/pipeline.*.log
 ```
 
 On success the bilingual EPUB is added to Calibre and served at the OPDS feed
-(`books.foundby.kr/opds`); the reader can also pull it, or it is pushed to the device
-directly if reachable. The full agent runbook lives in
+(`books.foundby.kr/opds`); current X3/X4 firmware should save the public no-auth
+feed as `http://books.foundby.kr/opds` because its Cloudflare HTTPS handshake fails.
+The reader can pull it, or the EPUB is pushed to the device directly if reachable.
+The full agent runbook lives in
 `.agents/skills/book-translator/SKILL.md`.

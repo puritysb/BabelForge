@@ -6,12 +6,19 @@ import tempfile
 import unittest
 
 from extract import Chapter
-from precision import (_call_json, _validate_concepts, build_concept_sheet, choose_original_candidate,
-                       _related_lexical_candidates, extract_repeated_phrases, flat_glossary,
+from precision import (_call_json, _cohesive_source_forms,
+                       _reconcile_lexical_targets, _validate_concepts,
+                       _vet_related_candidates, build_concept_sheet,
+                       choose_original_candidate, _related_lexical_candidates,
+                       extract_repeated_phrases, flat_glossary,
                        precision_profile_hash)
-from quality_audit import audit_and_correct, find_violations
+from quality_audit import (QualityAuditError, audit_and_correct,
+                           audit_translation_quality,
+                           find_translation_integrity_violations,
+                           find_violations)
 from translate import (TranslatedBook, TranslatedChapter, _concept_rules,
-                       _quality_profile_fingerprint, translate_book)
+                       _quality_profile_fingerprint,
+                       _remap_structural_checkpoint, translate_book)
 from unittest.mock import patch
 
 
@@ -29,6 +36,39 @@ class PrecisionResearchTests(unittest.TestCase):
         self.assertTrue(parsed["concepts"][0]["fixed"])
         self.assertEqual(2, len(calls))
         self.assertIn("repair", calls[1][0]["content"])
+        repair_payload = json.loads(calls[1][1]["content"])
+        self.assertEqual("test stage", repair_payload["stage"])
+        self.assertIn("broken", repair_payload["malformed_output"])
+
+    def test_empty_json_response_regenerates_original_task(self):
+        replies = iter(["", '{"concepts":[{"regenerated":true}]}'])
+        calls = []
+
+        def chat(messages):
+            calls.append(messages)
+            return next(replies)
+
+        parsed = _call_json(chat, "system", "original payload", "test stage")
+        self.assertTrue(parsed["concepts"][0]["regenerated"])
+        self.assertEqual(2, len(calls))
+        self.assertIn("fresh JSON regeneration", calls[1][0]["content"])
+        self.assertEqual("original payload", calls[1][1]["content"])
+
+    def test_parameter_error_during_repair_regenerates_without_slicing(self):
+        calls = []
+
+        def chat(messages):
+            calls.append(messages)
+            if len(calls) == 1:
+                return '{"concepts":[{"broken":'
+            if len(calls) == 2:
+                raise RuntimeError("Z.ai HTTP 400 business_code=1213")
+            return '{"concepts":[{"recovered":true}]}'
+
+        parsed = _call_json(chat, "system", "complete evidence", "normalization")
+        self.assertTrue(parsed["concepts"][0]["recovered"])
+        self.assertEqual(3, len(calls))
+        self.assertEqual("complete evidence", calls[2][1]["content"])
 
     def test_repeated_phrase_extraction_includes_lowercase_concept(self):
         text = (
@@ -48,6 +88,104 @@ class PrecisionResearchTests(unittest.TestCase):
         }])
         terms = {row["source_terms"][0] for row in related}
         self.assertIn("Freidenker", terms)
+
+    def test_thinker_role_scan_does_not_require_freigeist_anchor(self):
+        text = (
+            "freie Geister freie Geister freie Geister. "
+            "Ein jüdischer Freidenker erscheint nur einmal. "
+            "Die Meinung des Denkers bleibt offen."
+        )
+        related = _related_lexical_candidates(text, [{
+            "source_terms": ["freie Geister"],
+            "original_terms": ["freier Geist"],
+        }])
+        terms = {row["source_terms"][0] for row in related}
+        self.assertIn("Freidenker", terms)
+        self.assertNotIn("Denkers", terms)
+
+    def test_thinker_role_scan_has_priority_in_bounded_candidates(self):
+        text = (
+            "Freigeist Freigeist Freigeist. "
+            + " ".join(f"Freigxxxx{i}" for i in range(20))
+            + " Ein Freidenker widerspricht."
+        )
+        related = _related_lexical_candidates(text, [{
+            "source_terms": ["Freigeist"],
+            "original_terms": ["Freigeist"],
+        }], limit=1)
+        self.assertEqual("Freidenker", related[0]["source_terms"][0])
+
+    def test_different_head_nouns_cannot_share_strict_mapping(self):
+        forms = _cohesive_source_forms([
+            "freier Geist", "freie Geister", "Freigeist", "Freigeister",
+            "Freigesinnten", "freien Geister", "freien Willen",
+        ])
+        self.assertIn("Freigeist", forms)
+        self.assertIn("freien Geister", forms)
+        self.assertNotIn("freien Willen", forms)
+        self.assertNotIn("Freigesinnten", forms)
+
+    def test_base_lemma_excludes_derivational_form_from_strict_mapping(self):
+        text = (
+            "Der freier Geist und freie Geister heißen auch Freigeist und "
+            "Freigeister, aber Freigeisterei ist eine eigene Bildung."
+        )
+        concepts = _validate_concepts([{
+            "concept_id": "freigeist.forms",
+            "source_terms": [
+                "freier Geist", "freie Geister", "Freigeist",
+                "Freigeister", "Freigeisterei",
+            ],
+            "original_terms": ["freier Geist", "Freigeist"],
+            "canonical_ko": "자유정신",
+            "confidence": "high",
+            "strict": True,
+        }], text, set())
+        self.assertEqual([
+            "freier Geist", "freie Geister", "Freigeist", "Freigeister",
+        ], concepts[0]["source_terms"])
+
+    def test_conflicting_inflectional_targets_follow_higher_confidence(self):
+        concepts = _reconcile_lexical_targets([{
+            "concept_id": "freier.geist",
+            "source_terms": ["freier Geist", "freie Geister"],
+            "original_terms": ["freier Geist"],
+            "canonical_ko": "자유로운 정신",
+            "avoid_ko": ["자유사상가"],
+            "confidence": "high",
+        }, {
+            "concept_id": "freigeist.inflection",
+            "source_terms": ["Freigeister"],
+            "original_terms": ["Freigeist"],
+            "canonical_ko": "자유사상가",
+            "avoid_ko": ["자유로운 정신"],
+            "confidence": "medium",
+        }])
+        self.assertEqual("자유로운 정신", concepts[1]["canonical_ko"])
+        self.assertIn("자유사상가", concepts[1]["avoid_ko"])
+        self.assertNotIn("자유로운 정신", concepts[1]["avoid_ko"])
+
+    def test_neighbor_screening_preserves_distinct_freethinker(self):
+        candidates = [{
+            "source_terms": ["Freidenker"], "original_terms": ["Freidenker"],
+            "kind": "related_candidate",
+        }, {
+            "source_terms": ["Freilich"], "original_terms": ["Freilich"],
+            "kind": "related_candidate",
+        }]
+
+        def chat(messages):
+            # Even if the screening model misses it, a distinct thinker-role
+            # lemma remains mandatory for the later evidence-based adjudication.
+            return json.dumps({"candidates": []})
+
+        selected = _vet_related_candidates(
+            candidates,
+            "Der Freidenker widerspricht. Freilich ist dies schwer.",
+            "Menschliches", "Nietzsche", chat,
+        )
+        self.assertEqual(["Freidenker"], selected[0]["source_terms"])
+        self.assertEqual(1, len(selected))
 
     def test_unsafe_fragments_and_alternative_targets_are_rejected(self):
         text = "Der freie Geist sieht höhere Kultur und niedere Kultur."
@@ -114,6 +252,17 @@ class PrecisionResearchTests(unittest.TestCase):
             "confidence": "high",
             "strict": True,
             "evidence_urls": ["https://example.org/primary"],
+        }, {
+            "concept_id": "freethinker",
+            "source_terms": ["free-thinker"],
+            "original_terms": ["Freidenker"],
+            "canonical_ko": "자유사상가",
+            "avoid_ko": ["자유정신"],
+            "kind": "concept",
+            "rationale": "Freigeist와 구별되는 사상가 유형",
+            "confidence": "high",
+            "strict": True,
+            "evidence_urls": ["https://example.org/primary"],
         }]
 
         def chat(messages):
@@ -125,8 +274,11 @@ class PrecisionResearchTests(unittest.TestCase):
                     "kind": "concept", "why_important": "central",
                     "search_query": "Freigeist Nietzsche Korean",
                 }]})
-            key = "concepts" if len(calls) in {2, 4} else "proposed_concepts"
-            return json.dumps({key: final_concepts}, ensure_ascii=False)
+            if len(calls) == 2:
+                return json.dumps({"candidates": [{
+                    "source_terms": ["free-thinker"],
+                }]})
+            return json.dumps({"concepts": final_concepts}, ensure_ascii=False)
 
         def search(query, count=4):
             return [{"title": "Primary text", "link": "https://example.org/primary",
@@ -136,8 +288,9 @@ class PrecisionResearchTests(unittest.TestCase):
             chapters, "Human, All Too Human", "Nietzsche", "en",
             {"source_is_translation": True, "original_language": "de"},
             chat, search)
-        self.assertEqual(4, len(calls))
+        self.assertEqual(5, len(calls))
         self.assertEqual("자유정신", flat_glossary(sheet)["free spirit"])
+        self.assertEqual("자유사상가", flat_glossary(sheet)["free-thinker"])
         self.assertEqual("high", sheet["concepts"][0]["confidence"])
         self.assertEqual(sheet["profile_hash"], precision_profile_hash(sheet))
 
@@ -174,6 +327,350 @@ class PrecisionResearchTests(unittest.TestCase):
 
 
 class QualityAuditTests(unittest.TestCase):
+    def test_whole_book_audit_repairs_untranslated_quote_and_korean_typo(self):
+        book = TranslatedBook(
+            title="Test", author="N",
+            chapters=[TranslatedChapter(title="V", pairs=[
+                ("Sorrow is knowledge, and knowledge wounds.",
+                 "Sorrow is knowledge, and knowledge wounds."),
+                ('"Unmoralisch" bezeichnet einen Zurückgebliebenen.',
+                 '"비도델적"은 뒤처진 자를 가리킨다.'),
+            ])],
+        )
+
+        def chat(messages):
+            payload = json.loads(messages[1]["content"])
+            self.assertEqual(2, len(payload["paragraphs"]))
+            return json.dumps({"paragraphs": [{
+                "chapter_index": 0, "paragraph_index": 0,
+                "action": "correct",
+                "corrected_ko": "슬픔은 인식이며, 인식은 상처를 입힌다.",
+                "reason": "영어 인용문이 미번역 상태다.",
+            }, {
+                "chapter_index": 0, "paragraph_index": 1,
+                "action": "correct",
+                "corrected_ko": '"비도덕적"은 뒤처진 자를 가리킨다.',
+                "reason": "한국어 오탈자를 바로잡았다.",
+            }]}, ensure_ascii=False)
+
+        report = audit_translation_quality(book, chat, chunk_size=2)
+        self.assertEqual(2, report["semantic_paragraphs_corrected"])
+        self.assertEqual([], find_translation_integrity_violations(book))
+        self.assertIn("비도덕적", book.chapters[0].pairs[1][1])
+
+    def test_whole_book_audit_rejects_kept_untranslated_passage(self):
+        book = TranslatedBook(
+            title="Test", author="N",
+            chapters=[TranslatedChapter(title="V", pairs=[
+                ("Sorrow is knowledge, and knowledge wounds.",
+                 "Sorrow is knowledge, and knowledge wounds."),
+            ])],
+        )
+
+        def chat(messages):
+            return json.dumps({"paragraphs": [{
+                "chapter_index": 0, "paragraph_index": 0,
+                "action": "keep", "reason": "incorrect keep",
+            }]})
+
+        with self.assertRaisesRegex(QualityAuditError, "failed closed"):
+            audit_translation_quality(book, chat, chunk_size=1)
+
+    def test_distinct_source_lemma_can_contextually_exempt_avoided_korean(self):
+        book = TranslatedBook(
+            title="Test", author="N",
+            chapters=[TranslatedChapter(title="V", pairs=[
+                (
+                    "Der Nutzen der Erkenntniss und die Bereicherung des Wissens.",
+                    "인식의 유용성과 지식의 풍부함.",
+                ),
+                (
+                    "Die moderne Cultur und der Sieg der Bildung.",
+                    "근대 문화와 교양의 승리.",
+                ),
+            ])],
+        )
+        sheet = {"concepts": [{
+            "concept_id": "c10", "source_terms": ["Erkenntniss"],
+            "canonical_ko": "인식", "avoid_ko": ["지식"],
+            "rationale": "Wissen과 구별", "strict": True,
+        }, {
+            "concept_id": "c03", "source_terms": ["Cultur"],
+            "canonical_ko": "문화", "avoid_ko": ["교양"],
+            "rationale": "Bildung과 구별", "strict": True,
+        }]}
+        self.assertEqual(2, len(find_violations(book, sheet)))
+
+        def chat(messages):
+            payload = json.loads(messages[1]["content"])
+            self.assertEqual(2, len(payload["paragraphs"]))
+            return json.dumps({"paragraphs": [{
+                "chapter_index": 0, "paragraph_index": 0,
+                "action": "keep",
+                "corrected_ko": "인식의 유용성과 지식의 풍부함.",
+                "contextual_exemptions": [{
+                    "concept_id": "c10", "avoid_ko": "지식",
+                    "source_expression": "Wissens",
+                    "reason": "지식은 별도 원어 Wissen의 번역이다.",
+                }],
+            }, {
+                "chapter_index": 0, "paragraph_index": 1,
+                "action": "keep",
+                "corrected_ko": "근대 문화와 교양의 승리.",
+                "contextual_exemptions": [{
+                    "concept_id": "c03", "avoid_ko": "교양",
+                    "source_expression": "Bildung",
+                    "reason": "교양은 별도 원어 Bildung의 번역이다.",
+                }],
+            }]}, ensure_ascii=False)
+
+        report = audit_and_correct(book, sheet, chat, chunk_size=2)
+        self.assertTrue(report["passed"])
+        self.assertEqual(2, report["contextual_exemptions"])
+        self.assertEqual(0, report["paragraphs_corrected"])
+
+    def test_contextual_exemption_cannot_hide_missing_canonical_term(self):
+        book = TranslatedBook(
+            title="Test", author="N",
+            chapters=[TranslatedChapter(title="V", pairs=[
+                ("Die Erkenntniss wächst.", "지식이 자란다."),
+            ])],
+        )
+        sheet = {"concepts": [{
+            "concept_id": "c10", "source_terms": ["Erkenntniss"],
+            "canonical_ko": "인식", "avoid_ko": ["지식"],
+            "rationale": "strict epistemological term", "strict": True,
+        }]}
+
+        def chat(messages):
+            return json.dumps({"paragraphs": [{
+                "chapter_index": 0, "paragraph_index": 0,
+                "action": "keep", "corrected_ko": "지식이 자란다.",
+                "contextual_exemptions": [{
+                    "concept_id": "c10", "avoid_ko": "지식",
+                    "source_expression": "Erkenntniss",
+                    "reason": "잘못된 예외 시도",
+                }],
+            }]}, ensure_ascii=False)
+
+        with self.assertRaisesRegex(QualityAuditError, "reviewed 0/1"):
+            audit_and_correct(book, sheet, chat)
+
+    def test_nonconceptual_idiom_can_exempt_source_sense(self):
+        book = TranslatedBook(
+            title="Test", author="N",
+            chapters=[TranslatedChapter(title="V", pairs=[
+                ("Die Reise geschah in Wahrheit aus Abenteuerlust.",
+                 "그 여행은 실은 모험심 때문에 이루어졌다."),
+            ])],
+        )
+        sheet = {"concepts": [{
+            "concept_id": "c05", "source_terms": ["Wahrheit"],
+            "canonical_ko": "진리", "avoid_ko": ["참됨"],
+            "rationale": "epistemological concept", "strict": True,
+        }]}
+
+        def chat(messages):
+            return json.dumps({"paragraphs": [{
+                "chapter_index": 0, "paragraph_index": 0,
+                "action": "keep",
+                "corrected_ko": "그 여행은 실은 모험심 때문에 이루어졌다.",
+                "contextual_exemptions": [],
+                "source_sense_exemptions": [{
+                    "concept_id": "c05",
+                    "source_expression": "in Wahrheit",
+                    "reason": "여기서는 철학 개념이 아니라 '실은'이라는 관용구다.",
+                }],
+            }]}, ensure_ascii=False)
+
+        report = audit_and_correct(book, sheet, chat)
+        self.assertTrue(report["passed"])
+        self.assertEqual(1, report["source_sense_exemptions"])
+        self.assertEqual(0, report["paragraphs_corrected"])
+
+    def test_standalone_concept_cannot_claim_source_sense_exemption(self):
+        book = TranslatedBook(
+            title="Test", author="N",
+            chapters=[TranslatedChapter(title="V", pairs=[
+                ("Die Wahrheit bleibt.", "사실은 남는다."),
+            ])],
+        )
+        sheet = {"concepts": [{
+            "concept_id": "c05", "source_terms": ["Wahrheit"],
+            "canonical_ko": "진리", "avoid_ko": [], "strict": True,
+        }]}
+
+        def chat(messages):
+            return json.dumps({"paragraphs": [{
+                "chapter_index": 0, "paragraph_index": 0,
+                "action": "keep", "corrected_ko": "사실은 남는다.",
+                "contextual_exemptions": [],
+                "source_sense_exemptions": [{
+                    "concept_id": "c05", "source_expression": "Wahrheit",
+                    "reason": "부당한 독립 용어 예외",
+                }],
+            }]}, ensure_ascii=False)
+
+        with self.assertRaisesRegex(QualityAuditError, "reviewed 0/1"):
+            audit_and_correct(book, sheet, chat)
+
+    def test_new_forbidden_synonym_is_discarded_after_complete_classification(self):
+        book = TranslatedBook(
+            title="Test", author="N",
+            chapters=[TranslatedChapter(title="V", pairs=[
+                (
+                    "Erkenntniss und Wissen.",
+                    "인식과 지식.",
+                ),
+            ])],
+        )
+        sheet = {"concepts": [{
+            "concept_id": "c10", "source_terms": ["Erkenntniss"],
+            "canonical_ko": "인식", "avoid_ko": ["지식", "앎"],
+            "rationale": "Wissen과 구별", "strict": True,
+        }]}
+        calls = []
+
+        def chat(messages):
+            payload = json.loads(messages[1]["content"])
+            calls.append(payload)
+            if len(calls) == 1:
+                # The reviewer removed the original avoided word but introduced
+                # a different forbidden synonym without exempting that literal.
+                return json.dumps({"paragraphs": [{
+                    "chapter_index": 0, "paragraph_index": 0,
+                    "action": "correct", "corrected_ko": "인식과 앎.",
+                    "contextual_exemptions": [{
+                        "concept_id": "c10", "avoid_ko": "지식",
+                        "source_expression": "Wissen",
+                        "reason": "Wissen의 번역",
+                    }],
+                }]}, ensure_ascii=False)
+            self.assertIn("validation_feedback", payload)
+            return json.dumps({"paragraphs": [{
+                "chapter_index": 0, "paragraph_index": 0,
+                "action": "keep", "corrected_ko": "인식과 지식.",
+                "contextual_exemptions": [{
+                    "concept_id": "c10", "avoid_ko": "지식",
+                    "source_expression": "Wissen",
+                    "reason": "지식은 별도 원어 Wissen의 번역이다.",
+                }],
+            }]}, ensure_ascii=False)
+
+        report = audit_and_correct(book, sheet, chat)
+        self.assertTrue(report["passed"])
+        self.assertEqual(1, len(calls))
+        self.assertEqual("인식과 지식.", book.chapters[0].pairs[0][1])
+
+    def test_correction_cannot_break_another_matched_strict_concept(self):
+        book = TranslatedBook(
+            title="Test", author="N",
+            chapters=[TranslatedChapter(title="V", pairs=[
+                ("Erkenntniss und Cultur.", "인식과 교양."),
+            ])],
+        )
+        sheet = {"concepts": [{
+            "concept_id": "c10", "source_terms": ["Erkenntniss"],
+            "canonical_ko": "인식", "avoid_ko": ["지식", "앎"],
+            "strict": True,
+        }, {
+            "concept_id": "c03", "source_terms": ["Cultur"],
+            "canonical_ko": "문화", "avoid_ko": ["교양"],
+            "strict": True,
+        }]}
+        calls = []
+
+        def chat(messages):
+            payload = json.loads(messages[1]["content"])
+            calls.append(payload)
+            self.assertEqual({"c03", "c10"}, {
+                rule["concept_id"] for rule in payload["rules"]
+            })
+            if len(calls) == 1:
+                return json.dumps({"paragraphs": [{
+                    "chapter_index": 0, "paragraph_index": 0,
+                    "action": "correct", "corrected_ko": "앎과 문화.",
+                    "contextual_exemptions": [],
+                    "source_sense_exemptions": [],
+                }]}, ensure_ascii=False)
+            return json.dumps({"paragraphs": [{
+                "chapter_index": 0, "paragraph_index": 0,
+                "action": "correct", "corrected_ko": "인식과 문화.",
+                "contextual_exemptions": [],
+                "source_sense_exemptions": [],
+            }]}, ensure_ascii=False)
+
+        report = audit_and_correct(book, sheet, chat)
+        self.assertTrue(report["passed"])
+        self.assertEqual(2, len(calls))
+        self.assertEqual("인식과 문화.", book.chapters[0].pairs[0][1])
+
+    def test_complete_context_classification_preserves_original_paragraph(self):
+        book = TranslatedBook(
+            title="Test", author="N",
+            chapters=[TranslatedChapter(title="V", pairs=[
+                ("Erkenntniss, Cultur und Bildung.", "인식, 문화와 교양."),
+            ])],
+        )
+        sheet = {"concepts": [{
+            "concept_id": "c10", "source_terms": ["Erkenntniss"],
+            "canonical_ko": "인식", "avoid_ko": ["앎"], "strict": True,
+        }, {
+            "concept_id": "c03", "source_terms": ["Cultur"],
+            "canonical_ko": "문화", "avoid_ko": ["교양"], "strict": True,
+        }]}
+
+        def chat(messages):
+            # Even if the reviewer needlessly rewrites another valid concept,
+            # a complete separate-lemma classification makes this a keep-only
+            # decision and the original paragraph must win.
+            return json.dumps({"paragraphs": [{
+                "chapter_index": 0, "paragraph_index": 0,
+                "action": "correct", "corrected_ko": "앎, 문화와 교양.",
+                "contextual_exemptions": [{
+                    "concept_id": "c03", "avoid_ko": "교양",
+                    "source_expression": "Bildung",
+                    "reason": "교양은 별도 원어 Bildung의 번역이다.",
+                }],
+                "source_sense_exemptions": [],
+            }]}, ensure_ascii=False)
+
+        report = audit_and_correct(book, sheet, chat)
+        self.assertTrue(report["passed"])
+        self.assertEqual(0, report["paragraphs_corrected"])
+        self.assertEqual("인식, 문화와 교양.", book.chapters[0].pairs[0][1])
+
+    def test_multiple_concepts_in_one_paragraph_are_applied_once(self):
+        book = TranslatedBook(
+            title="Test", author="N",
+            chapters=[TranslatedChapter(title="V", pairs=[
+                ("Cultur und Erkenntniss.", "교양과 지식."),
+            ])],
+        )
+        sheet = {"concepts": [{
+            "concept_id": "c03", "source_terms": ["Cultur"],
+            "canonical_ko": "문화", "avoid_ko": ["교양"], "strict": True,
+        }, {
+            "concept_id": "c10", "source_terms": ["Erkenntniss"],
+            "canonical_ko": "인식", "avoid_ko": ["지식"], "strict": True,
+        }]}
+
+        def chat(messages):
+            payload = json.loads(messages[1]["content"])
+            self.assertEqual(1, len(payload["paragraphs"]))
+            self.assertEqual(2, len(payload["paragraphs"][0]["violations"]))
+            return json.dumps({"paragraphs": [{
+                "chapter_index": 0, "paragraph_index": 0,
+                "action": "correct", "corrected_ko": "문화와 인식.",
+                "contextual_exemptions": [],
+            }]}, ensure_ascii=False)
+
+        report = audit_and_correct(book, sheet, chat)
+        self.assertEqual(2, report["violations_found"])
+        self.assertEqual(1, report["paragraphs_reviewed"])
+        self.assertEqual(1, report["paragraphs_corrected"])
+        self.assertEqual("문화와 인식.", book.chapters[0].pairs[0][1])
+
     def test_violation_is_corrected_and_rechecked(self):
         book = TranslatedBook(
             title="Test", author="N",
@@ -215,7 +712,7 @@ class QualityAuditTests(unittest.TestCase):
 
         def chat(messages):
             payload = json.loads(messages[1]["content"])
-            stashed = payload["violations"][0]["current_ko"]
+            stashed = payload["paragraphs"][0]["current_ko"]
             self.assertIn("◀Q0TAG0▶", stashed)
             return json.dumps({"corrections": [{
                 "chapter_index": 0, "paragraph_index": 0,
@@ -239,10 +736,15 @@ class QualityAuditTests(unittest.TestCase):
         replies = iter([
             "[1] 자유정신은 이유를 요구한다.",
             "[1] 자유정신은 이유를 요구한다.",
+            json.dumps({"paragraphs": [{
+                "chapter_index": 0, "paragraph_index": 0,
+                "action": "keep", "reason": "정확한 번역이다.",
+            }]}, ensure_ascii=False),
         ])
         with tempfile.TemporaryDirectory() as temp_dir:
             checkpoint = os.path.join(temp_dir, "book.json")
-            with patch("translate._chat", side_effect=lambda messages: next(replies)):
+            with patch("translate._chat",
+                       side_effect=lambda messages, **kwargs: next(replies)):
                 book = translate_book(
                     "Test", "N",
                     [Chapter(title="V", paragraphs=[
@@ -259,6 +761,25 @@ class QualityAuditTests(unittest.TestCase):
                              saved["quality_profile_hash"])
             self.assertEqual("자유정신은 이유를 요구한다.",
                              saved["chapters"][0]["pairs"][0][1])
+
+    def test_structural_checkpoint_remaps_exact_source_units(self):
+        checkpoint = {
+            "title": "Test", "author": "N", "source_lang": "de",
+            "chapters": [{"title": "Untitled (Part 1/2)", "pairs": [
+                ["Boilerplate", "보일러플레이트"],
+                ["Erster\nTeil", "첫 부분"],
+                ["Zweiter Teil", "둘째 부분"],
+            ]}],
+        }
+        chapters = [
+            Chapter(title="Eins", paragraphs=["Erster Teil"]),
+            Chapter(title="Zwei", paragraphs=["Zweiter Teil"]),
+        ]
+        remapped = _remap_structural_checkpoint(
+            checkpoint, chapters, "Test", "N", "de", minimum_coverage=1.0)
+        self.assertIsNotNone(remapped)
+        self.assertEqual("첫 부분", remapped[0][0][1])
+        self.assertEqual("둘째 부분", remapped[1][0][1])
 
 
 if __name__ == "__main__":
