@@ -90,3 +90,19 @@ class RetryRequestTests(unittest.TestCase):
         catalog.update(self.req, status='translating', worker_pid=999999999,
                        worker_started_ms=1)
         self.assertEqual('failed', babelforge_mcp.get_status(self.req)['status'])
+
+    def test_list_recovers_legacy_orphan_without_spawning(self):
+        with patch.object(catalog.time, 'time', return_value=1):
+            catalog.update(self.req, status='translating')
+        with patch.object(babelforge_mcp, '_spawn_pipeline') as spawn:
+            self.assertEqual('failed', babelforge_mcp.list_recent()[0]['status'])
+        spawn.assert_not_called()
+
+    def test_server_startup_recovers_existing_orphans(self):
+        with patch.object(catalog.time, 'time', return_value=1):
+            catalog.update(self.req, status='translating')
+        with patch.object(babelforge_mcp.sys, 'argv', ['babelforge_mcp.py']), \
+             patch.object(babelforge_mcp.mcp, 'run') as run:
+            babelforge_mcp.main()
+            run.assert_called_once_with(transport='stdio')
+        self.assertEqual('failed', catalog.get(self.req)['status'])

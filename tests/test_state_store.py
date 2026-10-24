@@ -7,6 +7,7 @@ import multiprocessing
 import os
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -26,6 +27,15 @@ def _queue_book(args):
     path, epub = args
     config.PENDING_PUSH_PATH = path
     pending_queue.enqueue(epub, 'Book', 'Author')
+
+
+def _hold_worker(path, directory, req, ready):
+    config.CATALOG_PATH = path
+    config.CHECKPOINT_DIR = directory
+    with catalog.request_worker(req):
+        catalog.update(req, status='translating')
+        ready.set()
+        time.sleep(60)
 
 
 class StateTransactionsTests(unittest.TestCase):
@@ -109,6 +119,101 @@ class StateTransactionsTests(unittest.TestCase):
         self.assertEqual('failed', catalog.reconcile_worker(req)['status'])
         self.assertEqual({'title': 'Book'}, catalog.claim_retry(req))
         self.assertEqual('launching', catalog.get(req)['status'])
+
+    def test_legacy_orphan_without_worker_metadata_is_recovered_once(self):
+        req = catalog.new_request('legacy book')
+        with patch.object(catalog.time, 'time', return_value=1):
+            catalog.update(req, status='translating',
+                           progress={'done': 120, 'total': 337}, error='old detail')
+        record = catalog.reconcile_worker(req)
+        self.assertEqual('failed', record['status'])
+        self.assertIn('no persisted candidate', record['error'])
+        self.assertEqual({'done': 120, 'total': 337}, record['progress'])
+        self.assertEqual('translating', record['worker_recovery']['previous_status'])
+        self.assertEqual('old detail', record['worker_recovery']['previous_error'])
+        self.assertEqual(record, catalog.reconcile_worker(req))
+
+    def test_recent_recovers_orphans_outside_requested_page(self):
+        old = catalog.new_request('old book')
+        with patch.object(catalog.time, 'time', return_value=1):
+            catalog.update(old, status='translating',
+                           selected={'title': 'Book'}, publish_output=False, notify=False)
+        catalog.new_request('newer book')
+        catalog.recent(1)
+        record = catalog.get(old)
+        self.assertEqual('failed', record['status'])
+        self.assertEqual({'title': 'Book'}, catalog.claim_retry(old))
+        self.assertIs(catalog.get(old)['publish_output'], False)
+        self.assertIs(catalog.get(old)['notify'], False)
+
+    def test_pending_selection_and_terminal_records_are_unchanged(self):
+        for status in ('requested', 'searching', 'selected', 'failed', 'completed', 'published'):
+            req = catalog.new_request(status)
+            with patch.object(catalog.time, 'time', return_value=1):
+                before = catalog.update(req, status=status)
+            self.assertEqual(before, catalog.reconcile_worker(req))
+
+    def test_recent_untracked_worker_state_has_startup_grace(self):
+        req = catalog.new_request('book')
+        before = catalog.update(req, status='translating')
+        self.assertEqual(before, catalog.reconcile_worker(req))
+
+    def test_all_worker_stages_recover_without_metadata(self):
+        for status in catalog.WORKER_STATES:
+            with self.subTest(status=status):
+                req = catalog.new_request(status)
+                with patch.object(catalog.time, 'time', return_value=1):
+                    catalog.update(req, status=status)
+                self.assertEqual('failed', catalog.reconcile_worker(req)['status'])
+
+    def test_live_lock_wins_over_missing_metadata_and_old_timestamp(self):
+        req = catalog.new_request('book')
+        with catalog.request_worker(req):
+            with patch.object(catalog.time, 'time', return_value=1):
+                catalog.update(req, status='translating',
+                               worker_pid=None, worker_started_ms=None)
+            self.assertEqual('translating', catalog.reconcile_worker(req)['status'])
+            self.assertEqual('translating', catalog.recent()[0]['status'])
+
+    def test_launch_reservation_is_bounded_even_when_pid_is_reused(self):
+        req = catalog.new_request('book')
+        catalog.prepare_worker(req, {'title': 'Book'})
+        self.assertEqual('launching', catalog.reconcile_worker(req)['status'])
+        catalog.update(req, worker_pid=os.getpid(), worker_claimed_ms=1)
+        self.assertEqual('failed', catalog.reconcile_worker(req)['status'])
+        self.assertIsNone(catalog.get(req)['worker_pid'])
+
+    def test_reused_pid_after_worker_started_does_not_block_recovery(self):
+        req = catalog.new_request('book')
+        catalog.update(req, status='translating', worker_pid=os.getpid(), worker_started_ms=1)
+        self.assertEqual('failed', catalog.reconcile_worker(req)['status'])
+
+    def test_unspawned_launch_is_recovered_after_grace_expires(self):
+        req = catalog.new_request('book')
+        with patch.object(catalog.time, 'time', return_value=1):
+            catalog.prepare_worker(req, {'title': 'Book'})
+        self.assertEqual('failed', catalog.reconcile_worker(req)['status'])
+        self.assertEqual({'title': 'Book'}, catalog.claim_retry(req))
+
+    def test_tracked_worker_lost_during_selection_is_recovered(self):
+        req = catalog.new_request('book')
+        catalog.update(req, status='selected', worker_started_ms=1)
+        self.assertEqual('failed', catalog.reconcile_worker(req)['status'])
+
+    def test_terminated_process_is_recovered_by_listing(self):
+        req = catalog.new_request('book')
+        ctx = multiprocessing.get_context('spawn')
+        ready = ctx.Event()
+        worker = ctx.Process(target=_hold_worker, args=(self.path, self.directory, req, ready))
+        worker.start()
+        try:
+            self.assertTrue(ready.wait(10), 'worker did not acquire lock')
+            self.assertEqual('translating', catalog.recent()[0]['status'])
+        finally:
+            worker.terminate()
+            worker.join(10)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual('failed', catalog.recent()[0]['status'])
 
     def test_completed_local_request_is_terminal(self):
         req = catalog.new_request('book')

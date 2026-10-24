@@ -158,11 +158,12 @@ def get_status(req_id: str | None = None) -> dict:
 
 @mcp.tool()
 def list_recent(limit: int = 5) -> list[dict]:
-    """List recent translation requests and their status (newest first)."""
+    """List recent requests after recovering orphaned workers (newest first)."""
     return catalog.recent(limit)
 
 
 def main() -> None:
+    catalog.reconcile_workers()
     if "--http" in sys.argv:
         mcp.settings.host = config.MCP_HOST
         mcp.settings.port = config.MCP_PORT

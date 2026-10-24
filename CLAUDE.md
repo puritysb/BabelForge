@@ -135,6 +135,13 @@ explicit-device tools may still reference `crosspoint-agentdeck`; generation doe
   audit records remain distinct from obsolete deliverable files.
 - **Concurrency:** use catalog/queue transaction helpers; `os.replace()` alone is
   not a read-modify-write lock. Hold `catalog.request_worker(req_id)` for the run.
+  MCP startup, status lookup and recent-request listing recover orphaned worker
+  states, including legacy rows with no PID. Recovery holds the free worker lock
+  through the catalog update, preserves progress and records the prior state.
+  Live locks and fresh launch reservations take precedence; untracked legacy
+  worker stages have a 60-second startup grace. Waiting search/selection requests
+  and terminal records are preserved. Missing persisted candidates require a new
+  source selection rather than promising an impossible retry.
 - **Completion:** local output is `completed`; published output is `published`.
   Revision promotion remains retryable until obsolete cleanup finishes; CLI
   publication owns the same request lock as normal pipeline workers.
