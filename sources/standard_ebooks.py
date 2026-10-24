@@ -4,12 +4,12 @@ The SE OPDS feed requires a member token/IP allow-list and 401s from some
 networks, so we fall back to the public website search which returns the same
 metadata. Downloads are EPUB-3, well-typeset, public domain.
 """
-import os
 import re
 import warnings
 import requests
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from sources import Candidate, SourceText
+from sources.download import cached_source, store_response
 import config
 
 BASE = "https://standardebooks.org"
@@ -41,9 +41,11 @@ def search(query: str, limit: int = config.MAX_CANDIDATES) -> list[Candidate]:
             continue
         href = path.split("?")[0].split("#")[0]
         segs = [s for s in href.strip("/").split("/") if s]
-        # Book pages: /ebooks/<author-slug>/<title-slug> → 3 segments.
-        # Author index pages: /ebooks/<author-slug> → 2 segments (skip).
-        if len(segs) != 3 or segs[0] != "ebooks":
+        # Translated editions append one or more contributor slugs. Exclude
+        # asset/reading links without excluding those legitimate editions.
+        if len(segs) < 3 or segs[0] != "ebooks" or any(
+                segment in {"downloads", "text", "images", "css"} or "." in segment
+                for segment in segs[3:]):
             continue
         if href in seen_paths:
             continue
@@ -57,7 +59,7 @@ def search(query: str, limit: int = config.MAX_CANDIDATES) -> list[Candidate]:
         author = author_slug.replace("-", " ").title()
         out.append(Candidate(
             source="standard_ebooks",
-            source_id=title_slug,
+            source_id="/".join(segs[1:]),
             title=title[:200],
             author=author,
             language="en",
@@ -78,16 +80,18 @@ def fetch(candidate: Candidate) -> SourceText:
     well-typeset). Pattern:
       /ebooks/<author>/<title>/downloads/<author>_<title>.epub
     """
-    cache_dir = os.path.join(config.CACHE_DIR,
-                             f"{candidate.source}-{candidate.source_id}")
-    os.makedirs(cache_dir, exist_ok=True)
-    dest = os.path.join(cache_dir, "book.epub")
-    if os.path.exists(dest):
-        return SourceText(candidate=candidate, format="epub", path=dest)
-
-    page_url = candidate.fetch_url
+    from urllib.parse import urljoin, urlparse
+    page_url = (candidate.extra or {}).get("page_url") or candidate.fetch_url
     if not page_url:
         raise ValueError(f"no page url for {candidate}")
+    cached = cached_source(candidate, page_url)
+    if cached is not None:
+        return cached
+    # Older saved candidates may already contain the resolved download URL.
+    if urlparse(page_url).path.endswith(".epub"):
+        r = SESSION.get(page_url, timeout=120)
+        r.raise_for_status()
+        return store_response(candidate, r, page_url, allowed_formats={"epub"})
     r = SESSION.get(page_url, timeout=25)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "lxml")
@@ -97,15 +101,10 @@ def fetch(candidate: Candidate) -> SourceText:
         # Skip "advanced" / "kepub" variants — pick the plain compatible epub.
         if "advanced" in href or "kepub" in href:
             continue
-        if href.startswith("/"):
-            href = BASE + href
-        epub_url = href
+        epub_url = urljoin(page_url, href)
         break
     if not epub_url:
         raise RuntimeError(f"no epub link on {page_url}")
-    candidate.fetch_url = epub_url
     r = SESSION.get(epub_url, timeout=120)
     r.raise_for_status()
-    with open(dest, "wb") as f:
-        f.write(r.content)
-    return SourceText(candidate=candidate, format="epub", path=dest)
+    return store_response(candidate, r, page_url, allowed_formats={"epub"})

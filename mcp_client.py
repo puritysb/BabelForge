@@ -6,10 +6,11 @@ protocol directly over urllib: initialize → notifications/initialized →
 tools/call. The Coding-Plan key (`GLM_API_KEY` / `ZAI_API_KEY`) authenticates
 the same MCP endpoints the REST API is billed against.
 
-Only `web_search(query)` is exposed for now — the auto-glossary uses it to
-ground name/place translations in real published usage rather than letting the
-model guess. Everything here fails soft: any error returns an empty result and
-never raises, so translation is never blocked by a search hiccup.
+Only `web_search(query)` is exposed for now. The mandatory precision preflight
+uses it for edition provenance and terminology evidence; independent LLM
+cross-validation still runs when a particular search returns no results.
+Everything here fails soft so one search transport hiccup does not erase the
+source-internal evidence available to that adjudication.
 """
 from __future__ import annotations
 

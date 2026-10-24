@@ -68,7 +68,11 @@ def format_for_line(candidates: list[Candidate], query: str) -> str:
         badge = {"gutenberg": "GB", "standard_ebooks": "SE",
                  "annas_archive": "AA", "local": "LOCAL"}.get(c.source, c.source)
         rights = f"[{c.rights}]" if c.rights and c.rights != "unknown" else ""
-        lines.append(f"{i}. [{badge}] {c.title} / {c.author} {rights}")
+        language = (c.language or "?").upper()
+        year = f" {c.year}" if c.year else ""
+        lines.append(
+            f"{i}. [{badge}·{language}] {c.title} / {c.author}{year} {rights}"
+        )
     return "\n".join(lines)
 
 
@@ -95,7 +99,7 @@ def notify_line(message: str) -> bool:
             check=True, timeout=30, env=env,
         )
         return True
-    except subprocess.CalledProcessError as e:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
         sys.stderr.write(f"LINE send failed: {e}\n")
         return False
 

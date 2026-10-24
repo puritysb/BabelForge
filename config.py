@@ -36,6 +36,7 @@ CATALOG_PATH = os.path.join(DATA_DIR, "catalog.json")    # request state machine
 ATTEMPTS_PATH = os.path.join(DATA_DIR, "attempts.json")  # book ids we already tried
 PENDING_PUSH_PATH = os.path.join(DATA_DIR, "pending-push.json")  # auto-push queue
 CHECKPOINT_DIR = os.path.join(DATA_DIR, "checkpoints")   # translation resume state
+CONCEPT_DIR = os.path.join(DATA_DIR, "concepts")         # per-request precision research
 
 VENV_PYTHON = os.path.join(BASE_DIR, "venv", "bin", "python3")
 
@@ -50,10 +51,11 @@ MCP_PORT = int(os.environ.get("BABELFORGE_MCP_PORT", "8770"))
 CALIBRE_LIBRARY = os.path.expanduser("~/Calibre-Library")
 CALIBRE_PORT = 8080
 CALIBREDB = "/opt/homebrew/bin/calibredb"
-# calibredb must go THROUGH the running Content Server (direct db access is
-# blocked while calibre-server holds the library lock). --enable-local-write
-# is on, so the server accepts writes from localhost.
+# Prefer the Content Server. A managed, explicitly read-only local server can
+# be paused for CLI writes and restarted without changing its access policy.
 CALIBREDB_URL = f"http://localhost:{CALIBRE_PORT}"
+CALIBRE_LAUNCH_AGENT = os.path.expanduser(os.environ.get(
+    "BABELFORGE_CALIBRE_LAUNCH_AGENT", "~/Library/LaunchAgents/com.local.calibre-server.plist"))
 OPDS_DOMAIN = "books.foundby.kr"                         # cloudflared → localhost:8080
 OPDS_BASE_URL = f"https://{OPDS_DOMAIN}"
 OPDS_FEED_URL = f"{OPDS_BASE_URL}/opds"
@@ -73,6 +75,11 @@ TRANSLATE_BATCH_PARAGRAPHS = 20                          # max paragraphs per GL
 # Packing to a char budget keeps output well under the ceiling and improves
 # throughput. Small paragraphs still batch up to TRANSLATE_BATCH_PARAGRAPHS.
 TRANSLATE_BATCH_MAX_CHARS = 2200
+# Final semantic/terminology repairs may return full Korean text PLUS source
+# evidence. Count limits alone cannot keep that output inside 8192 tokens.
+QUALITY_AUDIT_BATCH_PARAGRAPHS = 12
+QUALITY_AUDIT_MAX_INPUT_CHARS = 24000
+QUALITY_AUDIT_MAX_REPAIR_CHARS = 6000
 # 4 retries (backoff 1/2/4/8s = 15s total) wasn't enough headroom during the
 # Nietzsche run — 17 batches exhausted all 4 and still hit 429. Raised so
 # backoff has real room to clear a sustained rate-limit window; this is a
@@ -82,15 +89,9 @@ TRANSLATE_TIMEOUT_S = 240
 TRANSLATE_WORKERS = 2  # concurrent GLM calls (each ~20s on the coding plan;
                        # reduced from 8 due to GLM 429 rate limiting)
 
-# Bilingual granularity. When True (default), source paragraphs are split
-# into sentences BEFORE translation, so each cp-original / cp-translation
-# pair is one sentence — the reader sees short English/Chinese/etc. lines
-# alternating with short Korean lines, which is what most bilingual readers
-# expect. When False, the pair unit is the source's native paragraph (longer
-# blocks, fewer TOC entries per chapter, but each "row" is a big wall of
-# text). The firmware's ChapterHtmlSlimParser honours <p>-level markers
-# regardless of length, so sentence-level is safe.
-SENTENCE_LEVEL_SPLIT = True
+# Keep the author's paragraph containers. This opt-in makes smaller sentence
+# units inside them; long text is always bounded by the translation budget.
+SENTENCE_LEVEL_SPLIT = os.environ.get("BABELFORGE_SENTENCE_SPLIT", "0") == "1"
 
 # ─── Sources ───
 GUTENDEX_API = "https://gutendex.com/books"
@@ -119,38 +120,30 @@ MAX_CANDIDATES = 8                                       # candidates sent per s
 # local-subnet port-80 scan with CrossPoint fingerprinting. Set
 # OPENCLAW_XTEINK_HOST to pin a specific IP only as a last resort.
 DEVICE_HOST = os.environ.get("OPENCLAW_XTEINK_HOST", "auto")
-DEVICE_PUSH_ENABLED = True
+DEVICE_PUSH_ENABLED = os.environ.get("BABELFORGE_DEVICE_PUSH", "0") == "1"
 DEVICE_PUSH_PATH = "/Books"                                # SD card destination folder
 DEVICE_PUSH_TIMEOUT = 12                                  # total seconds for the push
 DEVICE_PROBE_TIMEOUT = 3                                  # is the HTTP server up?
 
-# ─── EPUB format contract (see crosspoint-agentdeck/docs/bilingual-epub.md) ───
-ORIGINAL_CLASS = "cp-original"
-TRANSLATION_CLASS = "cp-translation"
+# ─── Portable EPUB 3 ───
+# CSS classes are presentation hooks only. Reading requires no custom parser,
+# font package, language toggle, or device-specific memory limit.
+ORIGINAL_CLASS = "bf-original"
+TRANSLATION_CLASS = "bf-translation"
 BILINGUAL_SUFFIX = "(KO bilingual)"
-# Source / translation languages for the hybrid xml:lang marker (emitted
-# alongside cp-* classes for standard alignment + screen-reader accessibility).
-# The reader's parser matches the primary subtag against dc:language.
+# Both languages are included in OPF metadata and on individual XHTML blocks.
 SOURCE_LANG = "en"
 TRANSLATION_LANG = "ko"
 
-# ─── Translation Quality Improvements ───
-TWO_PASS_TRANSLATION = True  # Enable 2-Pass (Draft + Proofread) translation
-GLOSSARY_PATH = os.path.join(DATA_DIR, "glossary.json")  # Terminology glossary path
-# Auto-glossary: pipeline.py extracts recurring proper nouns/terms before
-# translation and (when GLOSSARY_ENRICH) asks GLM for their canonical Korean
-# rendering, so a name/place is translated the same way across all concurrent workers.
-# Enrichment costs one extra GLM call per book; on the z.ai Coding Plan that's
-# negligible and it clearly lifts terminology consistency, so default ON.
-GLOSSARY_ENABLED = True
-GLOSSARY_ENRICH = True
-# When GLOSSARY_WEB_SEARCH, enrichment first web-searches the top terms via the
-# Z.ai web_search_prime MCP tool (see mcp_client.py) and grounds GLM's Korean
-# renderings in real published usage instead of letting it guess — the whole
-# point of a glossary is the *established* rendering of a name/place. Bounded to
-# the GLOSSARY_WEB_SEARCH_TERMS most frequent terms to keep it to a few calls.
-GLOSSARY_WEB_SEARCH = True
-GLOSSARY_WEB_SEARCH_TERMS = 8
+# ─── Mandatory precision translation ───
+# There is deliberately no "fast" mode. Every book gets bibliographic source
+# research, original-language replacement when a public-domain edition can be
+# resolved, web-grounded concept adjudication, an adversarial terminology
+# cross-check, semantic proofreading, and a fail-closed final audit.
+# Kept for the standalone translate.py compatibility path. The production
+# pipeline writes request-scoped structured sheets under CONCEPT_DIR and passes
+# their flattened mappings explicitly, so concurrent books never share this.
+GLOSSARY_PATH = os.path.join(DATA_DIR, "glossary.json")
 
 # ─── Z.ai MCP (Streamable HTTP; same Coding-Plan key as the REST API) ───
 ZAI_MCP_WEB_SEARCH_URL = "https://api.z.ai/api/mcp/web_search_prime/mcp"
@@ -159,7 +152,8 @@ ZAI_MCP_TIMEOUT_S = 60
 
 
 def ensure_dirs():
-    for d in (DATA_DIR, LIBRARY_DIR, CACHE_DIR, LOGS_DIR, CHECKPOINT_DIR):
+    for d in (DATA_DIR, LIBRARY_DIR, CACHE_DIR, LOGS_DIR, CHECKPOINT_DIR,
+              CONCEPT_DIR):
         os.makedirs(d, exist_ok=True)
 
 

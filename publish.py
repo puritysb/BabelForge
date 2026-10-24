@@ -7,13 +7,22 @@ After add, we tag the book so it's easy to find from the device's OPDS browser
 and return the public OPDS acquisition URL.
 """
 from __future__ import annotations
+import hashlib
+import json
 import os
-import shutil
 import subprocess
 import sys
-import urllib.parse
+from contextvars import ContextVar
 
 import config
+from state_store import file_lock
+
+calibre_target = ContextVar("calibre_publication_target", default=None)
+
+
+def db_command(*args):
+    return [config.CALIBREDB, "--with-library",
+            calibre_target.get() or config.CALIBREDB_URL, *args]
 
 
 def _run(args: list[str], timeout: int = 60) -> str:
@@ -30,87 +39,97 @@ def _run(args: list[str], timeout: int = 60) -> str:
         raise
 
 
-def add_to_library(epub_path: str, title: str, author: str,
-                   source: str = "", rights: str = "") -> int:
-    """Add EPUB to the Calibre library, return the new calibre book id.
+def edition_identifier(epub_path: str, source: str, source_id: str,
+                       source_lang: str) -> str:
+    """Identify an edition independently of title, author, or translation retry."""
+    if source_id:
+        identity = json.dumps([source, str(source_id), source_lang, "ko"],
+                              ensure_ascii=False).encode("utf-8")
+    else:
+        # Legacy CLI callers have no source identity. A content hash is safer
+        # than merging unrelated editions because their titles happen to match.
+        with open(epub_path, "rb") as f:
+            identity = f.read()
+    return hashlib.sha256(identity).hexdigest()
 
-    Idempotency: calibredb add never dedupes, so we first check for an existing
-    book with the same title and replace it.
-    """
+
+def _matching_ids(identifier: str) -> list[int]:
+    # Preserve the earlier --search/--for-machine fix: never infer identity
+    # from a positional query or the newest book in the whole library.
+    listing = _run(db_command(
+        "list", "--for-machine", "--fields", "identifiers",
+        "--search", f'identifiers:="babelforge:{identifier}"'))
+    rows = json.loads(listing)
+    if not isinstance(rows, list):
+        raise RuntimeError("Calibre returned an invalid book listing")
+    return [row["id"] for row in rows
+            if isinstance(row, dict) and isinstance(row.get("id"), int)
+            and not isinstance(row["id"], bool)
+            and isinstance(row.get("identifiers"), dict)
+            and row["identifiers"].get("babelforge") == identifier]
+
+
+def add_to_library(epub_path: str, title: str, author: str,
+                   source: str = "", rights: str = "", *,
+                   source_id: str = "", source_lang: str = "en",
+                   preferred_id: int | None = None) -> int:
+    """Upsert one identified edition without deleting an existing book record."""
     if not os.path.isfile(epub_path):
         raise FileNotFoundError(epub_path)
-
-    # Check for an existing copy to replace (avoids "Pride (KO bilingual) (2)").
-    existing_id = None
-    try:
-        listing = _run(config.calibredb_cmd("list",
-                                            f"search:title:=\"{title}\""))
-        for line in listing.strip().splitlines()[1:]:
-            parts = line.split(None, 1)
-            if parts and parts[0].isdigit():
-                existing_id = int(parts[0])
-                break
-    except Exception:
-        pass  # not fatal; just add
-    if existing_id is not None:
-        try:
-            _run(config.calibredb_cmd("remove", str(existing_id),
-                                      "--permanent"))
-        except Exception:
-            pass
-
-    args = config.calibredb_cmd("add")
-    # Apply metadata + tags at insert time so the OPDS feed is immediately clean.
-    # Note: calibredb add has no --comment option; comments are set via
-    # ebook-meta after the book exists (see _set_comment below).
-    tags = "bilingual, korean, openclaw"
+    identifier = edition_identifier(epub_path, source, source_id, source_lang)
+    languages = ",".join(dict.fromkeys(["ko", source_lang or "en"]))
+    tags = "bilingual,korean,babelforge"
     if source:
-        tags += f", source:{source}"
-    args += ["--title", title, "--authors", author or "Unknown",
-             "--tags", tags, "--languages", "kor,eng"]
-    args.append(epub_path)
-    out = _run(args, timeout=120)
-    # calibredb prints "Added book ids: N"
-    for line in out.splitlines():
-        if "Added book ids:" in line:
-            ids = line.split(":", 1)[1].strip()
-            try:
-                return int(ids.split(",")[0])
-            except ValueError:
-                pass
-    # Fallback: ask the database for the most recently added id.
-    listing = _run(config.calibredb_cmd("list", "--sort-by=timestamp",
-                                        "--descending", "--limit=1"))
-    for line in listing.strip().splitlines()[1:]:
-        parts = line.split(None, 1)
-        if parts and parts[0].isdigit():
-            return int(parts[0])
-    raise RuntimeError(f"could not determine new book id. output: {out!r}")
-
-
-def _set_comment(book_id: int, comment: str) -> None:
-    """Best-effort: set the comments field via the Content server API."""
-    try:
-        _run(config.calibredb_cmd("set_custom", "comments", str(book_id), comment),
-             timeout=30)
-    except Exception:
-        # Comments are cosmetic — don't fail the publish if this doesn't stick
-        # (e.g. server without the custom column).
-        pass
+        tags += f",source:{source}"
+    with file_lock(os.path.join(config.DATA_DIR, ".publish.lock")):
+        ids = _matching_ids(identifier)
+        if preferred_id is not None:
+            if preferred_id not in ids:
+                raise RuntimeError("Preferred record has no matching edition identity")
+            ids = [preferred_id]
+        if len(ids) > 1:
+            raise RuntimeError(f"Multiple Calibre records share edition {identifier}")
+        if ids:
+            book_id = ids[0]
+            # add_format preserves the book record and stable acquisition URL.
+            # No remove command is used, even if the replacement fails.
+            _run(db_command("add_format", str(book_id), epub_path), timeout=120)
+            _run(db_command(
+                "set_metadata", str(book_id), "--field", f"title:{title}",
+                "--field", f"authors:{author or 'Unknown'}",
+                "--field", f"languages:{languages}", "--field", f"tags:{tags}"))
+            return book_id
+        _run(db_command(
+            "add", "--duplicates", "--title", title, "--authors", author or "Unknown",
+            "--tags", tags, "--languages", languages,
+            "--identifier", f"babelforge:{identifier}", epub_path), timeout=120)
+        # Localized CLI output and concurrent unrelated imports cannot return
+        # another book's ID: resolve only the identifier just written.
+        ids = _matching_ids(identifier)
+        if len(ids) != 1:
+            raise RuntimeError("Could not uniquely verify the imported Calibre edition")
+        return ids[0]
 
 
 def opds_url_for(book_id: int) -> str:
-    """The acquisition entry URL on our public Content Server."""
-    # Calibre's OPDS exposes /opds/book/<id>; the acquisition link points at
-    # /opds/book/<id>/file?fmt=epub. We return the book page so the device's
-    # browser can render the entry and download from there.
-    return f"{config.OPDS_BASE_URL}/opds/book/{book_id}"
+    """Return a verified Calibre Content Server EPUB acquisition URL.
+
+    Current Calibre versions do not expose the historical ``/opds/book/<id>``
+    route (it returns 404). OPDS feeds themselves remain rooted at ``/opds``;
+    the stable acquisition target advertised by the server is ``/get/EPUB/N``.
+    """
+    return f"{config.OPDS_BASE_URL}/get/EPUB/{book_id}"
 
 
 def publish(epub_path: str, title: str, author: str,
-            source: str = "", rights: str = "") -> tuple[int, str]:
-    book_id = add_to_library(epub_path, title, author, source, rights)
-    return book_id, opds_url_for(book_id)
+            source: str = "", rights: str = "", *,
+            source_id: str = "", source_lang: str = "en",
+            request_id: str | None = None, **revision_options) -> tuple[int, str]:
+    from publication import publish_revision
+    result = publish_revision(epub_path, title, author, source=source, rights=rights,
+        source_id=source_id, source_lang=source_lang, request_id=request_id,
+        **revision_options)
+    return result["book_id"], result["opds_url"]
 
 
 def main():

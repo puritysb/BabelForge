@@ -34,7 +34,7 @@ class Candidate:
 @dataclass
 class SourceText:
     candidate: Candidate
-    format: str            # "epub" or "txt"
+    format: str            # "epub", "txt", or validated standalone "html"
     path: str              # local file path after fetch()
     chapters_hint: Optional[int] = None
 

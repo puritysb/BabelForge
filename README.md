@@ -1,108 +1,80 @@
 # BabelForge
 
-Public-domain book → **bilingual (original + Korean) EPUB** → **Calibre OPDS** pipeline, with
-best-effort push to an XTeink e-ink reader. Serves at **books.foundby.kr**.
+고전 서적의 원문과 한국어 번역을 함께 읽을 수 있는 **일반 EPUB 3**를 만듭니다.
+목차, 장 순서, 강조, 시·표, 이미지와 연결된 각주를 보존하고, 원문·번역을 각 본문
+블록 안에서 차례로 보여 줍니다. 특정 펌웨어, 전용 폰트나 기기 버튼은 필요하지 않습니다.
 
-Split out of the `OpenClaw` ops repo on 2026-07-05 as a standalone project. It was never
-tracked in OpenClaw's git history — this repo's history starts fresh.
+Gutenberg, Standard Ebooks, 로컬 파일을 입력으로 사용합니다. 원전·판본 조사와 개념
+교차검증, 문단 정렬 번역, 최종 의미·용어 검수를 거쳐 파일을 생성하며 Calibre/OPDS
+배포도 선택할 수 있습니다. 상세 운영 절차의 정본은
+[book-translator 스킬](.agents/skills/book-translator/SKILL.md)입니다.
 
-## Pipeline
-
-```
-request → search (Gutenberg / Standard Ebooks / Anna's / local)
-        → fetch → extract chapters (BeautifulSoup)
-        → build auto-glossary (recurring names/terms → canonical Korean,
-                               web-search-grounded via Z.ai MCP)
-        → GLM translation (paragraph-aligned, batched, 2-pass draft+proofread,
-                            HTML-tag preserving, glossary + source-context aware)
-        → assemble bilingual EPUB (cp-original / cp-translation markers)
-        → publish: calibredb add → Calibre Content Server OPDS feed
-        → best-effort HTTP push to the XTeink e-ink reader
-        → LINE notify (via the openclaw CLI)
-```
-
-Orchestrator: `pipeline.py`. Config/paths: `config.py` (all paths derived from `__file__`, so
-the tree is relocatable). Entry points: `run_request.sh` (full pipeline), `start.sh` (detached),
-`search.py` (candidate search only).
-
-## Agent interface (MCP)
-
-BabelForge is a self-hosted appliance; agents drive it through the **`babelforge` MCP server**
-(`babelforge_mcp.py`) rather than the CLI. It runs streamable-HTTP under launchd
-(`com.local.babelforge-mcp`, `http://127.0.0.1:8770/mcp`) and exposes four tools:
-`search_books`, `translate_book` (returns a `req_id`; the pipeline runs detached), `get_status`,
-`list_recent`. Deploy: `cp deploy/com.local.babelforge-mcp.plist ~/Library/LaunchAgents/ &&
-launchctl load -w ~/Library/LaunchAgents/com.local.babelforge-mcp.plist`. Register the URL in
-your MCP client (repo `.mcp.json` for Claude Code; `openclaw mcp add`). The CLI below remains a
-fallback.
-
-## External dependencies (not vendored here)
-
-BabelForge is a self-contained Python project, but it leans on four things outside it:
-
-| Dependency | What for | Coupling |
-|---|---|---|
-| **`crosspoint-agentdeck`** repo (sibling checkout at `~/github/crosspoint-agentdeck`) | The **bilingual-EPUB format is defined there** — `docs/bilingual-epub.md` is the SSOT; `assemble.py`'s skeleton derives from its `scripts/generate_bilingual_test_epub.py`, and `build_font.py` reads its `lib/EpdFont/scripts`. | Producer↔consumer format contract. The reader firmware is the consumer; this pipeline is the producer. Changes are breaking on both sides — see that repo's `docs/bilingual-epub.md`. |
-| **`openclaw` CLI** (`/opt/homebrew/bin/openclaw`) | LINE notifications (`search.py`, `config.py:OPENCLAW_BIN`). | A single `openclaw message send` subprocess call. No code dependency. |
-| **Calibre Content Server** (launchd `com.local.calibre-server`, port 8080) | Hosts the OPDS feed at `books.foundby.kr/opds` (cloudflared → localhost:8080). `publish.py` only calls `calibredb add`. The older `books.getlingo.store` route may still exist as a compatibility alias, but generated BabelForge links use `books.foundby.kr`. | External service. |
-| **ZAI / GLM API** (`api.z.ai`) | Translation engine. Key from `.env` (`ZAI_API_KEY` / `GLM_API_KEY`) — never committed. | External API. |
-
-## Automation
-
-`auto_push_watcher.py` (retry queue for device pushes) runs under the LaunchAgent
-**`com.local.book-translator-watcher`** (`StartInterval` 20s, `--once` each fire). The plist
-lives at `~/Library/LaunchAgents/com.local.book-translator-watcher.plist` and was repointed to
-this path on the 2026-07-05 split. Logs: `logs/watcher.{out,err}.log`.
-
-## Setup
+## 설치
 
 ```bash
 python3 -m venv venv
-./venv/bin/pip install -r requirements.txt
-cp .env.example .env   # then fill ZAI_API_KEY
+./venv/bin/python3 -m pip install -r requirements.txt
+cp .env.example .env
+# .env에 GLM_API_KEY 또는 ZAI_API_KEY 설정
 ```
 
-> **Note:** `venv/` was moved wholesale from the old location on the split, so its
-> `bin/activate` and console-script shebangs still hold the old path. Invoking
-> `venv/bin/python3` directly (as `run_request.sh` and the LaunchAgent do) works fine; if you
-> need `activate` or the console scripts, recreate the venv from `requirements.txt`.
-
-`venv/`, `.env`, `data/`, `logs/`, and `__pycache__/` are gitignored.
-
-## Usage
-
-The flow is two steps: **search** for a book, then **translate** the candidate you pick.
+전체 EPUB 규격 검사에는 Java와 EPUBCheck가 필요합니다.
 
 ```bash
-# 1. Search — prints candidates as JSONL, one book per line.
+./venv/bin/python3 scripts/setup_epubcheck.py
+```
+
+이 명령은 공식 배포본의 체크섬을 확인하고 `data/tools/`에 설치합니다. 일반 구조 검사는
+항상 실행하며, 설치된 EPUBCheck도 자동으로 실행합니다. 정식 배포 환경에서는
+`BABELFORGE_REQUIRE_EPUBCHECK=1`로 전체 검사기 없이 배포되지 않게 설정할 수 있습니다.
+
+## 사용
+
+```bash
+# 후보 검색 후 선택한 후보 JSON을 candidate.json에 저장
 ./venv/bin/python3 search.py "pride and prejudice" --no-line
-./venv/bin/python3 search.py "annas: dostoevsky" --no-line   # opt-in Anna's Archive
 
-# 2. Save the ONE candidate line you want to a file, then run the pipeline.
-#    start.sh runs it detached (returns immediately; log under logs/).
-echo '<paste the chosen candidate JSON line here>' > candidate.json
-export ZAI_API_KEY=<your GLM Coding Plan key>   # or put GLM_API_KEY=... in .env
+# EPUB 파일만 생성: Calibre나 기기 없이 동작
+./run_request.sh candidate.json --no-publish --no-notify
+
+# Calibre 라이브러리와 OPDS에도 배포
 ./start.sh candidate.json
-
-#    …or run in the foreground (blocks until done, streams logs to the terminal):
-./run_request.sh candidate.json
 ```
 
-The pipeline runs fetch → extract → auto-glossary → translate → assemble → publish → device push,
-updating `data/catalog.json` at each step. A novel takes ~1–2h (2 concurrent GLM workers — lowered from 8 to stay under
-the Coding Plan's 429 rate limit); translation is checkpointed, so a killed
-run resumes where it left off on rerun, and a slot once translated is never
-blanked by a later failed batch.
+파일은 `data/library/`에 저장됩니다. 제목 외에 판본 식별 해시를 포함하여 동명 작품의
+파일 충돌을 피합니다. 로컬 생성 완료 상태는 `completed`, 공개 OPDS 다운로드까지 검증한 발행 완료는 `published`입니다.
+
+교정본 발행은 기존 항목의 ID와 주소를 유지해 교체하고, 공개 다운로드의 내용 대조와
+EPUBCheck가 끝난 뒤 같은 판본의 구판·중복을 삭제합니다. 구판 EPUB 백업은 만들지 않습니다.
+완료된 교정 manifest는 `publish_reviewed.py`로 발행하며, 절차와 설정은
+[book-translator 스킬](.agents/skills/book-translator/SKILL.md)에 있습니다.
+생성은 실제 번역 API 키가 필요하며 오류가 남은 번역이나 손상된 EPUB는 완료되지 않습니다.
+
+MCP에서는 `search_books`, `translate_book`, `retry_request`, `get_status`, `list_recent`를
+사용합니다. `translate_book(candidate, publish_output=False, notify=False)`는 로컬 EPUB만
+생성합니다. 재시도는 같은 요청 ID, 출력 모드, 알림 설정을 유지하며 종료된 작업자도 복구합니다.
+
+공개 OPDS 주소: **https://books.foundby.kr/opds**. 기기로 직접 보내는 기능은 기본적으로
+꺼져 있으며, 기존 장치 연동이 필요한 경우에만 `BABELFORGE_DEVICE_PUSH=1`로 켭니다.
+기기 전송이나 알림 실패는 EPUB 생성·배포 완료를 취소하지 않습니다.
+
+## 개발과 검증
 
 ```bash
-# Progress: last few requests and their status.
-./venv/bin/python3 -c "import catalog; print(catalog.recent(5))"
-
-# Live log of the most recent detached run.
-tail -f logs/pipeline.*.log
+./venv/bin/python3 -m unittest discover -s tests -v
+./venv/bin/python3 epub_validate.py /path/to/book.epub
 ```
 
-On success the bilingual EPUB is added to Calibre and served at the OPDS feed
-(`books.foundby.kr/opds`); the reader can also pull it, or it is pushed to the device
-directly if reachable. The full agent runbook lives in
-`.agents/skills/book-translator/SKILL.md`.
+테스트는 임시 상태와 가짜 API 응답을 사용합니다. 다운로드 포맷, 판본 캐시, 본문 보존,
+각주 링크, 다국어 무번역, 검수 후 변경, 체크포인트, 동시 갱신 및 배포 실패를 검사합니다.
+외부 API 번역의 문학적 품질은 별도 표본 평가가 필요합니다.
+
+번역 API나 배포 서비스 없이 직접 작성한 짧은 예제로 EPUB 생성·검증을 확인할 수 있습니다.
+
+```bash
+./venv/bin/python3 scripts/make_demo.py
+# data/examples/portable-bilingual-demo.epub 생성
+```
+
+[아키텍처·개발 지침](CLAUDE.md) · [EPUB 포맷 계약](docs/epub-format.md) ·
+[개선 전 검토 보고서](docs/PIPELINE_REVIEW_2026-10-22.md)

@@ -16,6 +16,7 @@ No IP is hard-coded — DHCP changes are tolerated by re-running discovery.
 """
 from __future__ import annotations
 import json
+import ipaddress
 import os
 import socket
 import struct
@@ -50,11 +51,10 @@ class PushResult:
 
 DEVICE_CACHE = os.path.join(config.DATA_DIR, ".device-cache.json")
 DEVICE_CACHE_TTL_S = 300         # 5 min — short so we tolerate DHCP/mode changes
-DEVICE_FINGERPRINTS = (b"crosspoint", b"CrossPoint", b"Crosspoint",
-                       b"file manager", b"file transfer", b"CrossPoint-Reader")
+DEVICE_FINGERPRINTS = (b"crosspoint", b"CrossPoint", b"Crosspoint", b"CrossPoint-Reader")
 
 
-def _local_subnets() -> list[tuple[int, int]]:
+def _local_subnets() -> list[tuple[str, int]]:
     """Yield (ip, mask_bits) for subnets to scan. Uses the primary interface's
     IPv4 address; assumes the device is on the same L2 segment (typical for
     home Wi-Fi where the Mac and the e-reader share the AP)."""
@@ -80,21 +80,8 @@ def _local_subnets() -> list[tuple[int, int]]:
 
 def _subnet_hosts(ip: str, mask_bits: int) -> list[str]:
     """Enumerate host IPs in the given subnet. Caps to /22 max for safety."""
-    if mask_bits < 24:
-        mask_bits = 24
-    if mask_bits > 24:
-        mask_bits = 22 if mask_bits <= 22 else 24
-    octets = [int(x) for x in ip.split(".")]
-    # /24 scan
-    if mask_bits == 24:
-        return [f"{octets[0]}.{octets[1]}.{octets[2]}.{i}" for i in range(1, 255)]
-    # /22 scan (256 * 4 = 1024 hosts — capped via timeout in callers)
-    third = octets[2] & 0xFC  # round down to /22 boundary
-    out = []
-    for t in range(third, third + 4):
-        for i in range(1, 255):
-            out.append(f"{octets[0]}.{octets[1]}.{t}.{i}")
-    return out
+    mask_bits = max(22, min(32, mask_bits))
+    return [str(host) for host in ipaddress.ip_network(f"{ip}/{mask_bits}", strict=False).hosts()]
 
 
 def _looks_like_crosspoint(ip: str, timeout: float = 0.8) -> bool:
@@ -160,7 +147,6 @@ def _discover_via_mdns(timeout_s: float = 3.0) -> Optional[str]:
     except ImportError:
         return None
 
-    found_ips: list[str] = []
     found_crosspoint: list[str] = []
 
     class _L:
@@ -177,14 +163,12 @@ def _discover_via_mdns(timeout_s: float = 3.0) -> Optional[str]:
                 info = None
             if not info or not info.addresses:
                 return
-            ip = socket.inet_ntoa(info.addresses[0])
-            found_ips.append(ip)
-            # Match by service name or by HTTP fingerprint.
-            name_l = (name or "").lower()
-            if "crosspoint" in name_l or "reader" in name_l:
-                found_crosspoint.append(ip)
-            else:
-                # Verify via HTTP fingerprint as a secondary signal.
+            # A service name alone is not device identity. Ignore unrelated
+            # printers/NAS HTTP services and verify every candidate over HTTP.
+            for address in info.addresses:
+                if len(address) != 4:
+                    continue
+                ip = socket.inet_ntoa(address)
                 if _looks_like_crosspoint(ip, timeout=0.6):
                     found_crosspoint.append(ip)
 
@@ -201,8 +185,6 @@ def _discover_via_mdns(timeout_s: float = 3.0) -> Optional[str]:
         time.sleep(timeout_s)
         if found_crosspoint:
             return found_crosspoint[0]
-        if found_ips:
-            return found_ips[0]
     except Exception:
         pass
     finally:
@@ -273,7 +255,7 @@ def discover_device(force: bool = False, verbose: bool = False) -> Optional[tupl
 def _server_alive(base_url: str, timeout: int) -> bool:
     try:
         r = requests.get(base_url + "/", timeout=timeout)
-        return r.status_code < 500
+        return r.status_code == 200 and any(fp in r.content[:4096] for fp in DEVICE_FINGERPRINTS)
     except requests.RequestException:
         return False
 

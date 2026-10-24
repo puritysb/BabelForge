@@ -2,9 +2,9 @@
 
 Public domain. The safest default source for auto-suggest.
 """
-import os
 import requests
 from sources import Candidate, SourceText
+from sources.download import download_source
 import config
 
 API = config.GUTENDEX_API
@@ -27,12 +27,16 @@ def search(query: str, limit: int = config.MAX_CANDIDATES) -> list[Candidate]:
             rights = "public domain" if b.get("copyright") is False else (
                 "copyright" if b.get("copyright") else "unknown"
             )
-            # prefer plain text utf-8; fall back to html
+            # Prefer the structured edition, retaining the selected MIME type.
             fmt = b.get("formats", {})
-            fetch_url = fmt.get("text/plain; charset=utf-8") \
-                or fmt.get("text/plain; charset=us-ascii") \
-                or fmt.get("text/html; charset=utf-8") \
-                or fmt.get("application/epub+zip")
+            media_type, fetch_url = next(
+                ((mime, fmt[mime]) for mime in (
+                    "application/epub+zip", "text/plain; charset=utf-8",
+                    "text/plain; charset=us-ascii", "text/plain",
+                    "text/html; charset=utf-8", "text/html") if fmt.get(mime)),
+                (None, None))
+            if not fetch_url:
+                continue
             out.append(Candidate(
                 source="gutenberg",
                 source_id=str(b["id"]),
@@ -41,7 +45,7 @@ def search(query: str, limit: int = config.MAX_CANDIDATES) -> list[Candidate]:
                 language=langs[0] if langs else "en",
                 rights=rights,
                 fetch_url=fetch_url,
-                extra={"gutenberg_id": b["id"]},
+                extra={"gutenberg_id": b["id"], "media_type": media_type},
             ))
             if len(out) >= limit:
                 break
@@ -54,15 +58,4 @@ def fetch(candidate: Candidate) -> SourceText:
     """Download the book text to cache; return path."""
     if not candidate.fetch_url:
         raise ValueError(f"no fetch_url for {candidate}")
-    ext = ".epub" if candidate.fetch_url.endswith(".epub") or "epub" in candidate.fetch_url else ".txt"
-    cache_dir = os.path.join(config.CACHE_DIR,
-                             f"{candidate.source}-{candidate.source_id}")
-    os.makedirs(cache_dir, exist_ok=True)
-    dest = os.path.join(cache_dir, f"book{ext}")
-    if not os.path.exists(dest):
-        r = SESSION.get(candidate.fetch_url, timeout=120)
-        r.raise_for_status()
-        with open(dest, "wb") as f:
-            f.write(r.content)
-    fmt = "epub" if ext == ".epub" else "txt"
-    return SourceText(candidate=candidate, format=fmt, path=dest)
+    return download_source(candidate, SESSION, candidate.fetch_url)
