@@ -38,6 +38,7 @@ instead of silently resetting the catalog or queue.
 | `precision.py` | Original-title/language research, conservative same-work/author/volume/rights selection, concept drafting, web grounding, adversarial review and normalization. |
 | `translate.py` | Numbered batch alignment, output budgets, retries, inline tags, source context, checkpoints and audit resume. |
 | `quality_audit.py` | Shared fidelity criteria, grounded correction proposals, independent exact-text approval, partial-row recovery, audit ledger, contextual terminology and bounded convergence. |
+| `model_json.py` | One conservative model-response decoder; rejects duplicate keys, extra answers/text, incomplete objects and non-finite numbers. Never used to repair stored state. |
 | `review_library.py` | Manifest-bound existing-edition review; exact source coverage recovery, retained Korean, source/term audits and resumable local EPUB rebuilds. |
 | `finish_library_review.py` | Final approval/quotation checks, source verse and TOC restoration, metadata, EPUBCheck and local reviewed-library ZIP delivery. |
 | `assemble.py` | Portable EPUB 3, both languages, structured source templates, inline emphasis, images, links, TOC/NCX, provenance and atomic validated output. |
@@ -151,6 +152,16 @@ explicit-device tools may still reference `crosspoint-agentdeck`; generation doe
 - **Anna's Archive:** only explicitly selected `annas:` searches may use it.
 - **Structured API:** use provider `response_format=json_object`. Business error
   `1213` is not a retryable rate-limit error. Empty inputs must not reach the API.
+  JSON mode does not guarantee usable model content. Parse with `model_json.py`,
+  then validate the stage schema and source-grounded decisions. Only complete
+  objects with an optional whole-response fence/BOM or redundant closing brackets
+  are recoverable; never extract decisions from prose, arrays or multiple answers.
+  Duplicate keys at any depth, non-finite numbers and invalid Unicode are rejected.
+  Stage owners share a three-attempt budget for model format/schema failures;
+  `_chat_json` validates one response without a hidden format-retry loop. Fresh
+  research retries retain the full original evidence, never ask a model to finish
+  a truncated decision. Permanent request/auth failures propagate immediately.
+  Format rejection logs include response length and hash, not book text or keys.
 
 ## Validation and development
 

@@ -33,6 +33,7 @@ import urllib.error
 from dataclasses import dataclass, field
 
 import config
+from model_json import ModelResponseError, ModelJSONError, parse_model_object
 from extract import Chapter
 from epub_markup import (placeholders_preserved, restore_inline_tags,
                          stash_inline_tags)
@@ -57,6 +58,10 @@ class TranslatedBook:
 
 class TranslationError(RuntimeError):
     pass
+
+
+class UnusableModelOutput(TranslationError, ModelResponseError):
+    """Response-format failure, distinct from permanent request/auth errors."""
 
 
 # The system prompt is built per-call so the source language can vary
@@ -226,15 +231,26 @@ def _chat(messages: list[dict], timeout: int = config.TRANSLATE_TIMEOUT_S,
         )
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                choice = data["choices"][0]
-                content = choice["message"].get("content")
+                try:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    choices = data["choices"]
+                    if not isinstance(choices, list) or len(choices) != 1:
+                        raise UnusableModelOutput("Z.ai must return exactly one completion")
+                    choice = choices[0]
+                    content = choice["message"].get("content")
+                    finish = choice.get("finish_reason")
+                except (ValueError, UnicodeError, KeyError, IndexError, TypeError, AttributeError) as exc:
+                    raise UnusableModelOutput("Z.ai returned a malformed completion envelope") from exc
                 if choice.get("finish_reason") == "length":
-                    raise TranslationError("Z.ai truncated assistant output (finish_reason=length)")
+                    raise UnusableModelOutput("Z.ai truncated assistant output (finish_reason=length)")
+                if finish != "stop":
+                    raise UnusableModelOutput("Z.ai did not finish a text response")
                 if not isinstance(content, str) or not content.strip():
                     finish = choice.get("finish_reason") or "unknown"
                     reasoning = choice["message"].get("reasoning_content") or ""
-                    raise TranslationError(
+                    if not isinstance(reasoning, str):
+                        reasoning = ""
+                    raise UnusableModelOutput(
                         f"Z.ai returned empty assistant content "
                         f"(finish_reason={finish}, reasoning_chars={len(reasoning)})"
                     )
@@ -269,8 +285,22 @@ def _chat(messages: list[dict], timeout: int = config.TRANSLATE_TIMEOUT_S,
 
 def _chat_json(messages: list[dict],
                timeout: int = config.TRANSLATE_TIMEOUT_S) -> str:
-    """Call GLM with the provider's native JSON-object response contract."""
-    return _chat(messages, timeout=timeout, json_mode=True)
+    """Validate one response; stage owners bound format/schema retries together."""
+    clean = _validate_messages(messages)
+    instruction = ("Return exactly one complete JSON object only. No Markdown or "
+                   "text outside the object. Never repeat keys or use NaN/Infinity.")
+    if clean[0]["role"] == "system":
+        clean[0] = {**clean[0], "content": clean[0]["content"] + "\n" + instruction}
+    else:
+        clean.insert(0, {"role": "system", "content": instruction})
+    raw = _chat(clean, timeout=timeout, json_mode=True)
+    try:
+        parsed = parse_model_object(raw)
+    except ModelJSONError as exc:
+        fingerprint = hashlib.sha256(raw.encode('utf-8', errors='surrogatepass')).hexdigest()
+        sys.stderr.write(f"[model-json] rejected chars={len(raw)} sha256={fingerprint}: {exc}\n")
+        raise
+    return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
 
 
 # Match a "[k] text..." block: the number at line start, then everything up to

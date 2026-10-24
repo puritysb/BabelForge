@@ -12,6 +12,8 @@ import json
 import re
 import sys
 import unicodedata
+from model_json import (ModelResponseError, ModelJSONError, parse_model_object,
+                        json_object_or_none as _json_object)
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, is_dataclass
@@ -52,98 +54,31 @@ def _as_dict(candidate) -> dict:
     return dict(candidate)
 
 
-def _json_object(raw: str) -> dict | None:
-    if not isinstance(raw, str):
-        return None
-    raw = raw.strip()
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
-    try:
-        value = json.loads(raw)
-        return value if isinstance(value, dict) else None
-    except json.JSONDecodeError:
-        pass
-    start, end = raw.find("{"), raw.rfind("}")
-    if 0 <= start < end:
+def _call_json(chat_fn: Callable, system: str, user: str, stage: str,
+               required_list: str | None = None, validator: Callable | None = None) -> dict:
+    # Regenerate from full original evidence, never turn a malformed proposal
+    # into a decision by asking another model to close or invent its contents.
+    feedback = ""
+    for attempt in range(3):
+        instruction = system + (
+            "\nReturn exactly one complete JSON object. No Markdown or text outside it. "
+            "Never repeat object keys or return NaN/Infinity."
+        )
+        if feedback:
+            instruction += "\nFresh JSON regeneration: " + feedback
         try:
-            value = json.loads(raw[start:end + 1])
-            return value if isinstance(value, dict) else None
-        except json.JSONDecodeError:
-            pass
-    return None
-
-
-def _call_json(chat_fn: Callable, system: str, user: str, stage: str) -> dict:
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ]
-    failures: list[str] = []
-    raw = ""
-    try:
-        response = chat_fn(messages)
-        raw = response if isinstance(response, str) else ""
-    except Exception as exc:
-        failures.append(f"initial call: {exc}")
-    parsed = _json_object(raw)
-    if parsed is not None:
-        return parsed
-
-    # Precise mode repairs malformed/truncated structured output autonomously
-    # instead of asking the user or silently dropping the research stage. Never
-    # send an empty model response as the next user message: Z.ai reports that
-    # invalid request as business code 1213. Wrapping malformed output in a
-    # non-empty JSON object also keeps control text separate from model output.
-    if raw.strip():
-        try:
-            repaired = chat_fn([
-                {"role": "system", "content": (
-                    "You repair malformed model output into strict valid JSON. "
-                    "Preserve the recoverable decisions, remove prose and "
-                    "markdown fences, close truncated structures, and keep "
-                    "rationales under 60 words. Return one JSON object only."
-                )},
-                {"role": "user", "content": json.dumps({
-                    "stage": stage,
-                    "malformed_output": raw,
-                }, ensure_ascii=False)},
-            ])
-        except Exception as exc:
-            failures.append(f"repair call: {exc}")
-        else:
-            parsed = _json_object(repaired)
-            if parsed is not None:
-                return parsed
-            failures.append("repair call returned invalid JSON")
-
-    # A repair request can itself be rejected or may have nothing recoverable
-    # when the first response was empty. Re-run the original task as a fresh
-    # structured-generation request, preserving its complete evidence payload.
-    # This is safer than slicing malformed JSON at arbitrary character offsets,
-    # which could silently discard a late but important concept.
-    regeneration_system = (
-        system
-        + "\n\nThis is a fresh JSON regeneration after an unusable prior response. "
-          "Return one complete JSON object only. Do not mention the prior attempt."
-    )
-    regeneration_user = user if isinstance(user, str) and user.strip() else "{}"
-    try:
-        regenerated = chat_fn([
-            {"role": "system", "content": regeneration_system},
-            {"role": "user", "content": regeneration_user},
-        ])
-    except Exception as exc:
-        failures.append(f"regeneration call: {exc}")
-    else:
-        parsed = _json_object(regenerated)
-        if parsed is not None:
+            raw = chat_fn([{"role": "system", "content": instruction},
+                           {"role": "user", "content": user}])
+            parsed = parse_model_object(raw)
+            if required_list and not isinstance(parsed.get(required_list), list):
+                raise ModelJSONError(f"required array missing or invalid: {required_list}")
+            if validator:
+                validator(parsed)
             return parsed
-        failures.append("regeneration call returned invalid JSON")
-
-    detail = "; ".join(failures) or "all responses were empty"
-    raise PrecisionError(
-        f"{stage} returned no valid JSON after repair and regeneration: {detail}"
-    )
+        except ModelResponseError as exc:
+            feedback = str(exc)
+            sys.stderr.write(f"[precision] {stage}: unusable response {attempt + 1}/3: {feedback}\n")
+    raise PrecisionError(f"{stage} returned no valid JSON after 3 attempts: {feedback}")
 
 
 def _normalise_lang(value: str | None) -> str:
@@ -169,6 +104,13 @@ def research_source(candidate, chat_fn: Callable, search_fn: Callable) -> dict:
          "snippet": r.get("content", "")[:700]}
         for r in results[:6] if isinstance(r, dict)
     ]
+    def validate_research(payload):
+        if (any(not isinstance(payload.get(key), str) or not payload[key].strip()
+                for key in ("original_language", "original_title", "reasoning"))
+                or type(payload.get("source_is_translation")) is not bool
+                or not isinstance(payload.get("confidence"), str)
+                or payload.get("confidence") not in {"high", "medium", "low"}):
+            raise ModelJSONError("invalid bibliographic research schema")
     payload = _call_json(
         chat_fn,
         "You are a bibliographic researcher. Determine the work's original "
@@ -179,7 +121,7 @@ def research_source(candidate, chat_fn: Callable, search_fn: Callable) -> dict:
         "(boolean), confidence (high|medium|low), and reasoning.",
         json.dumps({"candidate": cand, "web_evidence": evidence},
                    ensure_ascii=False),
-        "source research",
+        "source research", validator=validate_research,
     )
     original_lang = _normalise_lang(payload.get("original_language"))
     if not original_lang:
@@ -391,7 +333,7 @@ def _draft_concepts(chapters: list, title: str, author: str, source_lang: str,
             "repeated_candidates": repeated,
             "representative_excerpts": sample,
         }, ensure_ascii=False),
-        "concept extraction",
+        "concept extraction", required_list="concepts",
     )
     concepts = response.get("concepts")
     if not isinstance(concepts, list):
@@ -682,7 +624,7 @@ def _vet_related_candidates(candidates: list[dict], text: str, title: str,
             "candidates": candidates,
             "source_contexts": contexts,
         }, ensure_ascii=False),
-        "rare lexical-neighbor screening",
+        "rare lexical-neighbor screening", required_list="candidates",
     )
     allowed = {
         _first_source_term(candidate).casefold(): candidate
@@ -866,7 +808,7 @@ def build_concept_sheet(chapters: list, title: str, author: str,
                     "draft_concepts": research_candidates,
                     "source_contexts": contexts,
                     "web_evidence": web_evidence}, ensure_ascii=False),
-        "terminology adjudication",
+        "terminology adjudication", required_list="concepts",
     )
     first = _validate_concepts(adjudicated.get("concepts") or [], full_text,
                                allowed_urls)
@@ -893,10 +835,9 @@ def build_concept_sheet(chapters: list, title: str, author: str,
                     "proposed_concepts": first,
                     "source_contexts": contexts,
                     "web_evidence": web_evidence}, ensure_ascii=False),
-        "terminology cross-check",
+        "terminology cross-check", required_list="concepts",
     )
-    reviewed_concepts = (criticised.get("concepts")
-                         or criticised.get("proposed_concepts") or [])
+    reviewed_concepts = criticised["concepts"]
     reviewed = _validate_concepts(reviewed_concepts, full_text, allowed_urls)
 
     mandatory_related = [candidate for candidate in related
@@ -919,10 +860,10 @@ def build_concept_sheet(chapters: list, title: str, author: str,
         json.dumps({"concepts": reviewed, "source_contexts": contexts,
                     "required_source_forms": [_first_source_term(c) for c in mandatory_related]},
                    ensure_ascii=False),
-        "concept schema normalization",
+        "concept schema normalization", required_list="concepts",
     )
     final = _validate_concepts(
-        normalised.get("concepts") or normalised.get("proposed_concepts") or [],
+        normalised["concepts"],
         full_text, allowed_urls)
     final = _reconcile_lexical_targets(final)
     for repair_attempt in range(3):
@@ -952,7 +893,7 @@ def build_concept_sheet(chapters: list, title: str, author: str,
                         "previous_adjudication": reviewed,
                         "source_contexts": _contexts(full_text, missing_related),
                         "web_evidence": web_evidence}, ensure_ascii=False),
-            "missing lexical distinctions repair")
+            "missing lexical distinctions repair", required_list="concepts")
         final = _reconcile_lexical_targets(_validate_concepts(
             repaired.get("concepts") or [], full_text, allowed_urls))
     if drafts and not final:

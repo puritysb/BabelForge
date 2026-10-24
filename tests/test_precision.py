@@ -29,7 +29,7 @@ class PrecisionResearchTests(unittest.TestCase):
         self.assertTrue(set(forms) <= {'Ὀδυσσεύς', 'Ὀδυσῆος'})
         self.assertEqual(['ἦ', 'ἦ'], _cohesive_source_forms(['ἦ', 'ἦ']))
 
-    def test_malformed_json_is_repaired_autonomously(self):
+    def test_malformed_json_regenerates_original_evidence(self):
         replies = iter(['{"concepts":[{"broken":',
                         '{"concepts":[{"fixed":true}]}'])
         calls = []
@@ -41,10 +41,9 @@ class PrecisionResearchTests(unittest.TestCase):
         parsed = _call_json(chat, "system", "user", "test stage")
         self.assertTrue(parsed["concepts"][0]["fixed"])
         self.assertEqual(2, len(calls))
-        self.assertIn("repair", calls[1][0]["content"])
-        repair_payload = json.loads(calls[1][1]["content"])
-        self.assertEqual("test stage", repair_payload["stage"])
-        self.assertIn("broken", repair_payload["malformed_output"])
+        self.assertIn("Fresh JSON regeneration", calls[1][0]["content"])
+        self.assertEqual("user", calls[1][1]["content"])
+        self.assertNotIn("broken", calls[1][1]["content"])
 
     def test_empty_json_response_regenerates_original_task(self):
         replies = iter(["", '{"concepts":[{"regenerated":true}]}'])
@@ -57,24 +56,17 @@ class PrecisionResearchTests(unittest.TestCase):
         parsed = _call_json(chat, "system", "original payload", "test stage")
         self.assertTrue(parsed["concepts"][0]["regenerated"])
         self.assertEqual(2, len(calls))
-        self.assertIn("fresh JSON regeneration", calls[1][0]["content"])
+        self.assertIn("Fresh JSON regeneration", calls[1][0]["content"])
         self.assertEqual("original payload", calls[1][1]["content"])
 
-    def test_parameter_error_during_repair_regenerates_without_slicing(self):
+    def test_permanent_parameter_error_is_not_replayed(self):
         calls = []
-
         def chat(messages):
             calls.append(messages)
-            if len(calls) == 1:
-                return '{"concepts":[{"broken":'
-            if len(calls) == 2:
-                raise RuntimeError("Z.ai HTTP 400 business_code=1213")
-            return '{"concepts":[{"recovered":true}]}'
-
-        parsed = _call_json(chat, "system", "complete evidence", "normalization")
-        self.assertTrue(parsed["concepts"][0]["recovered"])
-        self.assertEqual(3, len(calls))
-        self.assertEqual("complete evidence", calls[2][1]["content"])
+            raise RuntimeError("Z.ai HTTP 400 business_code=1213")
+        with self.assertRaisesRegex(RuntimeError, "1213"):
+            _call_json(chat, "system", "complete evidence", "normalization")
+        self.assertEqual(1, len(calls))
 
     def test_repeated_phrase_extraction_includes_lowercase_concept(self):
         text = (
