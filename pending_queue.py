@@ -1,77 +1,47 @@
-"""Pending push queue — books that failed/skipped device push and should be
-retried automatically when the device next appears.
-
-Stored as data/pending-push.json. publish() success + push skip/failure lands
-here. The auto_push_watcher drains the queue whenever it discovers the device.
-
-Why a separate file (not catalog.json): the watcher runs as a different
-process under launchd with a different cadence. A small, append-only queue
-file keeps concurrency simple and survives restarts.
-"""
+"""Process-safe queue of optional device deliveries."""
 from __future__ import annotations
-import json
 import os
 import time
 from typing import Optional
-
 import config
+from state_store import json_transaction, read_json
 
 
-def _load() -> list[dict]:
-    if not os.path.isfile(config.PENDING_PUSH_PATH):
-        return []
-    try:
-        with open(config.PENDING_PUSH_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, list) else []
-    except (json.JSONDecodeError, OSError):
-        return []
+def _valid(items):
+    return (isinstance(items, list) and all(
+        isinstance(item, dict) and isinstance(item.get("epub_path"), str)
+        for item in items))
 
 
-def _atomic_write(items: list[dict]) -> None:
-    os.makedirs(os.path.dirname(config.PENDING_PUSH_PATH), exist_ok=True)
-    tmp = config.PENDING_PUSH_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(items, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, config.PENDING_PUSH_PATH)
+def _transaction():
+    return json_transaction(config.PENDING_PUSH_PATH, list, _valid)
 
 
 def enqueue(epub_path: str, title: str, author: str,
-            source: str = "", rights: str = "",
-            req_id: Optional[str] = None) -> None:
-    """Add a book to the pending push queue. Idempotent — re-enqueueing the
-    same path just refreshes its timestamp (no duplicates)."""
+            source: str = "", rights: str = "", req_id: Optional[str] = None,
+            notify: bool = False) -> None:
     if not os.path.isfile(epub_path):
-        return
-    items = _load()
-    # De-dup by epub_path: if it's already queued, update timestamp + metadata.
-    items = [it for it in items if it.get("epub_path") != epub_path]
-    items.append({
-        "epub_path": epub_path,
-        "title": title,
-        "author": author,
-        "source": source,
-        "rights": rights,
-        "req_id": req_id,
-        "queued_at_ms": int(time.time() * 1000),
-        "attempts": 0,
-    })
-    _atomic_write(items)
+        raise FileNotFoundError(epub_path)
+    with _transaction() as items:
+        items[:] = [item for item in items if item["epub_path"] != epub_path]
+        items.append({"epub_path": epub_path, "title": title, "author": author,
+                      "source": source, "rights": rights, "req_id": req_id,
+                      "notify": notify,
+                      "queued_at_ms": int(time.time() * 1000), "attempts": 0})
 
 
 def remove(epub_path: str) -> None:
-    items = [it for it in _load() if it.get("epub_path") != epub_path]
-    _atomic_write(items)
+    with _transaction() as items:
+        items[:] = [item for item in items if item["epub_path"] != epub_path]
 
 
 def list_pending() -> list[dict]:
-    return _load()
+    return read_json(config.PENDING_PUSH_PATH, list, _valid)
 
 
 def increment_attempts(epub_path: str) -> None:
-    items = _load()
-    for it in items:
-        if it.get("epub_path") == epub_path:
-            it["attempts"] = it.get("attempts", 0) + 1
-            it["last_attempt_ms"] = int(time.time() * 1000)
-    _atomic_write(items)
+    with _transaction() as items:
+        for item in items:
+            if item["epub_path"] == epub_path:
+                item["attempts"] = item.get("attempts", 0) + 1
+                item["last_attempt_ms"] = int(time.time() * 1000)

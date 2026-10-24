@@ -1,202 +1,174 @@
 ---
 name: book-translator
-description: Translate a requested book to Korean and deliver it to the Xteink X3/X4 OPDS browser. Use when the user says "OOO 책 번역해줘", "책 찾아줘", "bilingual book", "translate book to Korean", or references reading on the e-ink device. Searches public-domain catalogs (Project Gutenberg, Standard Ebooks), opt-in Anna's Archive (with `annas:` prefix), or local files; produces a bilingual EN/KO EPUB with cp-original/cp-translation markers; publishes it to the Calibre Content Server so the device's OPDS browser can find and download it.
+description: Find a public-domain book or use a local book and translate it into a portable original/Korean bilingual EPUB, with optional Calibre/OPDS publication. Use for book translation, bilingual book and e-reader delivery requests.
 metadata:
   openclaw:
     emoji: "📖"
 ---
 
-# book-translator skill
+# book-translator
 
-A producer pipeline that turns a book request into a bilingual EPUB on the
-Xteink X3/X4. Lives entirely off-device; the device only pulls the result via
-its existing OPDS browser.
+Use BabelForge to produce a standard EPUB readable in ordinary reading apps.
+Read the repository's `CLAUDE.md` for implementation context. The file-format contract
+is `docs/epub-format.md`; a firmware repository or special device is not required.
 
-## What it does
+## Choose the source and destination
 
-```
-request → search (Gutenberg / Standard Ebooks / Anna's / local)
-        → autonomously research provenance and prefer a verified public-domain
-          original-language edition over a relay translation
-        → fetch source text → extract chapters
-        → build a web-grounded, independently cross-checked and normalized concept sheet
-        → GLM-5.2 precision translation + semantic proofread
-        → fail-closed whole-book terminology audit and contextual repair
-        → assemble cp-original/cp-translation bilingual EPUB
-        → calibredb add → Content Server OPDS feed
-        → best-effort HTTP POST push to device (if File Transfer on)
-        → LINE notify (push result + OPDS pickup instructions)
-```
+Use the `babelforge` MCP server when available. Otherwise run the repository CLI with
+`./venv/bin/python3` directly; do not rely on historically moved venv activation scripts.
 
-The user opens the device's OPDS browser (or finds the file already pushed to
-`/Books`), picks the new book titled "<Title> (KO bilingual)", opens it, and
-long-presses Confirm to cycle Both → Original only → Translation only.
+- `search_books(query)` searches Gutenberg and Standard Ebooks. Show a short candidate
+  list when a title is ambiguous. If the user already selected a specific edition,
+  use that choice without asking again.
+- A filesystem path selects a local file. `annas:` is the only search opt-in for
+  Anna's Archive; do not add it to normal searches.
+- For an EPUB-file request use `translate_book(candidate, publish_output=False)`.
+  For library/OPDS delivery use `publish_output=True`. The tool default remains True
+  for compatibility with existing library workflows, so choose the flag explicitly.
+- `notify=False` suppresses all LINE messages. Do not enable external notifications
+  unless the user's request or established delivery workflow includes them.
 
-## Files
+The pipeline may replace a relay translation only when the original-language source
+can be matched to the same work, author and volume with eligible rights metadata.
+Uncertain matches retain the selected edition.
 
-- Pipeline code: `~/github/BabelForge/`
-- Config: `~/github/BabelForge/config.py`
-- State machine: `data/catalog.json` (requested → researching → selected →
-  analyzing → translating → quality_checked → assembling → published / failed)
-- Calibre library: `~/Calibre-Library/` (served by launchd
-  `com.local.calibre-server` on port 8080)
-- Public OPDS: `https://books.foundby.kr/opds` (cloudflared tunnel). X3/X4
-  setup uses `http://books.foundby.kr/opds`: the catalog is public/no-auth and
-  current reader firmware fails the Cloudflare TLS handshake while HTTP serves
-  the same feed without redirecting.
+## Run and follow progress
 
-## How the agent drives it
+`translate_book(candidate, publish_output=..., notify=...)` launches a detached worker
+and returns `req_id`. Use `get_status(req_id)` to follow the same request; do not create
+another request to inspect progress. `list_recent(n)` lists existing work.
 
-**Preferred: the `babelforge` MCP server** (launchd `com.local.babelforge-mcp`,
-`http://127.0.0.1:8770/mcp`). If your host has it, drive the appliance with typed
-tools instead of shelling out — no paths, no JSONL parsing:
-
-- `search_books(query)` → candidate list (prefix `annas:` to opt in; pass a file
-  path for a local file). Show up to 8, let the user pick one.
-- `translate_book(candidate)` → returns a `req_id` immediately; the precision
-  pipeline runs in the background. Pass the exact candidate dict the user chose;
-  it may autonomously replace a relay translation with a verified public-domain
-  original-language edition.
-- `retry_request(req_id)` → resumes a failed request under the same `req_id`,
-  reusing its verified source, concept sheet, and translation checkpoint. This
-  is the normal recovery path and does not require shell execution approval.
-- `get_status(req_id)` → progress %, then `published` (epub_path/opds_url) or
-  `failed` (error). A failed run is resumable — re-running continues from its
-  checkpoint.
-- `list_recent(n)` → recent requests.
-
-The CLI below is the **fallback** for hosts without the MCP server (it calls the
-same code).
-
-### 1. Search (return candidates to the user)
+CLI fallback, from the repository root:
 
 ```bash
-cd ~/github/BabelForge
-./venv/bin/python3 search.py "<query>" --no-line
+./venv/bin/python3 search.py "<title or author>" --no-line
+# Save the selected candidate object as candidate.json.
+./run_request.sh candidate.json --no-publish --no-notify
+# To publish through Calibre/OPDS instead:
+./start.sh candidate.json --no-notify
 ```
 
-Prints JSONL candidates (one per line). For Anna's Archive (opt-in,
-copyright = user responsibility):
+`config.py` loads `.env` containing `GLM_API_KEY` or `ZAI_API_KEY`; exported values take
+precedence. Never print the key. Local generation does not need Calibre. Publication
+needs the configured Calibre Content Server (`localhost:8080` in this installation).
+
+The pipeline researches the source and concepts, preserves source structure, translates
+and proofreads aligned units, converges semantic and terminology audits, assembles a
+portable EPUB, and validates it before completion/publication. There is no fast mode
+that bypasses unresolved accuracy failures.
+
+Output is `data/library/<title>-<identity>.epub`. `completed` means a validated local
+file; `published` means public acquisition verification and obsolete cleanup have
+also completed. Return the actual artifact
+path or acquisition URL, not device-specific button instructions. OPDS feed:
+`https://books.foundby.kr/opds`.
+
+## Validation and recovery
+
+Install the official pinned full validator with:
 
 ```bash
-./venv/bin/python3 search.py "annas: <query>" --no-line
+./venv/bin/python3 scripts/setup_epubcheck.py
+./venv/bin/python3 epub_validate.py /path/to/book.epub
 ```
 
-For a local file the user owns:
+Java is needed for EPUBCheck. Local structural checks always run. Full checking runs
+when the bundled distribution, `epubcheck` command or `EPUBCHECK_JAR` is available.
+`BABELFORGE_REQUIRE_EPUBCHECK=1` requires it; do not claim full conformance when the
+report says the external checker is unavailable.
+
+Use `retry_request(req_id)` for a failed or stopped worker. It keeps the request,
+source selection, saved output mode and notification preference, reuses compatible translation/audit checkpoints
+and prevents concurrent workers for the same request. Retry at most once for an unchanged
+transient failure; retry again only after evidence that the cause has changed. Inspect
+validation/quality errors rather than bypassing them or manually marking the request
+successful. Ordinary recovery does not require editing production code or state files.
+
+## Re-review existing editions
+
+For a request to apply current audits to existing bilingual books, use
+`review_library.py` rather than sending legacy checkpoints through a new draft
+profile. Create a JSON manifest with `review_dir` and `editions`; each edition binds
+`id`, `inputs` (baseline EPUB first, then any source-identical superseded versions),
+`source_path`, `source_format`, `language`, `title`, `author`, `source_name`,
+`source_url`, `rights`, `output` and known `source_research`. Paths are relative to
+the repository or explicitly absolute. Keep distinct relay editions separate.
 
 ```bash
-./venv/bin/python3 search.py "/path/to/book.epub" --no-line
+./venv/bin/python3 review_library.py manifest.json --prepare-only
+./venv/bin/python3 review_library.py manifest.json --workers 2
 ```
 
-Show the user up to 8 candidates and ask them to pick by number.
+Preparation records input hashes and an editorial baseline, verifies exact ordered source alignment and
+restores omitted TXT passages and logical source paragraph/chapter structure.
+Inspect coverage before running model calls; an edition mismatch must be resolved,
+not fuzzily aligned. Only restored/resegmented blank slots need drafting. All
+existing Korean receives the current source-grounded semantic and terminology
+review, including independent approval of repaired wording. The command checkpoints
+reviews and writes corrected EPUBs under the review directory after validation;
+it never publishes or notifies. Rerun the same manifest to resume, optionally with
+`--edition ID`. Diagnose unchanged validation/convergence failures before retrying.
+A book is complete only when its `result.json` and validated output exist. After
+all editions complete, run `./venv/bin/python3 finish_library_review.py manifest.json`.
+This verifies every current exact-text approval, restores explicit indented source
+line breaks and unlisted chapter navigation without changing approved Korean,
+then runs content comparison and official EPUBCheck again. Quotation-boundary or
+legacy abbreviation-boundary flags require source review before delivery. Save any
+content repair as an unapproved proposal in the isolated review checkpoint and
+rerun that edition; never insert a hand-written approval. It writes a local
+reviewed-edition folder and ZIP bundle. It does not retain old EPUB backups;
+live originals remain until explicitly requested publication verifies replacements.
+If a model repeatedly reverses a source-grounded correction, verify scholarly
+lexical/grammatical references and retain them in the isolated book's optional
+`source_evidence` map keyed by SHA-256 of the exact source string. Supply facts
+and reference locations, not an instruction to approve. Evidence binds only that
+passage's audit signature; changed evidence requires fresh independent approval.
+Optional manifest `attribution` supplements source metadata. Return the actual
+corrected EPUBs and report any incomplete editions explicitly.
 
-### 2. Translate + publish the chosen candidate
+## Publish corrected editions and remove superseded copies
 
-Take the chosen candidate JSON (one line from step 1), save it to a file, and:
+Normal publication now uses the same verified revision promotion as reviewed books.
+Do not use one-off backup/export/SQL scripts or mark a request published by hand.
+There is no old-edition backup: temporary validation/download files are removed
+automatically; hashes and stage journals remain under `data/publications/`.
 
 ```bash
-export ZAI_API_KEY=<GLM Coding Plan key>   # required for GLM-5.2
-cd ~/github/BabelForge
-./start.sh <candidate.json>
+./venv/bin/python3 publish_reviewed.py manifest.json --check-only
+./venv/bin/python3 publish_reviewed.py manifest.json
+# Or finish, validate and publish in one explicitly requested operation:
+./venv/bin/python3 finish_library_review.py manifest.json --publish
 ```
 
-`start.sh` runs `run_request.sh` detached (nohup); log lands in
-`logs/pipeline.<timestamp>.log`. The pipeline:
+Manifest editions may include `publication` with `source`, `source_id`, `request_id`,
+`destination` and `title`. Existing catalog source identities and Gutenberg edition
+URLs can supply missing identities; ambiguous local editions require explicit fields.
+Keep different languages/volumes/relay editions separate. An unidentified legacy
+Calibre item requires explicit `legacy_id`, `legacy_path` and `legacy_sha256`; its
+actual download must match that local artifact before binding the edition identifier.
 
-1. researches edition provenance and, when safely resolvable, switches from a
-   relay translation to a public-domain original-language source
-2. fetches the resolved source via its adapter
-3. extracts chapters (EPUB via ebooklib, txt via Gutenberg-header strip +
-   chapter regex)
-4. extracts book-wide concepts (including lowercase/multiword terms), gathers
-   web evidence, and makes the Korean terminology decisions through separate
-   adjudicator, adversarial-review, and enforcement-schema normalization passes;
-   malformed JSON is repaired automatically and no user approval is requested
-5. translates each chapter in 20-paragraph batches through GLM-5.2, with the
-   concept sheet and semantic-accuracy proofread applied to every batch
-6. independently reviews every final source/translation pair for semantic
-   errors, omissions, untranslated quotations, and malformed Korean; then
-   audits every strict concept occurrence, repairs violations in context, and
-   refuses publication if any issue remains. A normally
-   forbidden Korean string may remain only when an autonomous contextual review
-   records that it translates a different source lemma in that paragraph; a
-   canonical term may be omitted only when an exact longer source expression
-   proves that the matched spelling is a non-conceptual idiom, never for an
-   exact standalone concept occurrence
-7. assembles the bilingual EPUB (block-level `<p class="cp-original">` +
-   `<p class="cp-translation">` pairs — the firmware contract)
-8. `calibredb add` into `~/Calibre-Library/`, tagged
-   `bilingual, korean, openclaw`
-9. attempts an HTTP POST push of the EPUB to the device's File Transfer server
-   (`http://crosspoint.local/upload?path=/Books`). If the device isn't in
-   File Transfer mode, the push is silently skipped — the book is still
-   available via OPDS pull. Push result is recorded in `catalog.json` under
-   `device_push`.
-10. sends a LINE completion notice reflecting the delivery path (pushed
-   directly, or OPDS pickup instructions)
+Promotion validates the exact approved artifact, replaces the canonical Calibre EPUB
+while retaining its ID, follows public OPDS navigation/pagination, downloads both the
+advertised and stable acquisitions, compares all source/Korean pairs and requires
+official EPUBCheck. Only then does it commit the local library/catalog and delete
+known obsolete copies and same-identifier duplicate records. Deletion uses explicit
+paths and frozen hashes, never fuzzy titles. Verification failures do not run obsolete
+cleanup; an already uploaded canonical EPUB may be the new file. Incomplete cleanup
+remains retryable and journaled; resume the same command. Publication owns the
+request lock, so concurrent retry workers cannot rewrite its state.
 
-### 3. Report progress (if asked)
+A configured managed read-only server is stopped briefly for local CLI writes and
+restarted even after a write failure. Its public write policy is never weakened.
+An interrupted publisher records its own server-maintenance marker; the next
+publication recovers that service only if the configuration hash still matches.
+Unmanaged/remote write failures stop publication rather than bypassing server locks.
+Do not claim success merely because a Calibre import succeeded: return the verified
+acquisition URLs only after the final publication journal says `completed`.
 
-```bash
-./venv/bin/python3 -c "import catalog; print(catalog.recent(5))"
-```
+## Optional legacy device delivery
 
-### 4. Recover a failed request
-
-When the MCP status is `failed`, inspect the recorded error and use
-`retry_request(req_id)` for a retry-safe endpoint/structured-output failure.
-Retry automatically at most once for an unchanged failure, then poll the same
-`req_id`. A new retry is allowed after the underlying code or dependency state
-has materially changed and passed validation. Do not create a second request,
-edit production Python files, or fall back to shell commands merely to resume
-the book.
-
-If a shell command unexpectedly requests approval, do not print `/approve`
-yourself; only the user can grant that approval. Continue through the typed MCP
-tools when possible, otherwise report the exact blocked action.
-
-## Environment requirements
-
-- `ZAI_API_KEY` exported (GLM Coding Plan). Without it, translate.py fails
-  fast with an actionable message.
-- launchd agents `com.local.calibre-server` and `com.getlingo.openclaw.cloudflared`
-  both running (they are KeepAlive=true).
-
-## Device-side setup (one time, done by the user)
-
-1. RIDIBatang font installed at `/SD/.fonts/RIDIBatang/` and selected under
-   Settings → Reader → Font Family.
-2. Settings → System → OPDS Servers → Add Server:
-   - Name: `OpenClaw Library`
-   - URL: `http://books.foundby.kr/opds` (the feed is public; HTTP avoids the
-     verified X3/X4 TLS failure while retaining the stable domain)
-   - Username/Password: (none — Content Server runs without auth on the tunnel;
-     enable Basic auth later if exposing wider)
-3. Settings → Controls → Long-press Menu → cycle to **Bilingual Toggle**
-   (firmware must include the bilingual-toggle feature, merged in PR #1).
-
-After a book finishes, the user opens the OPDS browser on the device, searches
-"<Title> (KO bilingual)", downloads to SD, opens it, and long-presses Confirm
-to switch views.
-
-## Limits and guardrails
-
-- Default auto-suggest never touches Anna's Archive; the `annas:` prefix is
-  the only gate. Copyright is the user's responsibility.
-- Precision translation is mandatory. There is no fast-mode flag and no
-  terminology approval pause; source research and multiple evidence-based
-  model passes decide autonomously. Failed research or a remaining strict-term
-  violation blocks publication. A final full-book semantic/orthographic pass
-  must also review every pair and rejects untranslated substantive passages.
-- The firmware parser only honors block-level `<p>` cp-original/cp-translation
-  classes; the assembler never emits `<span>` markers.
-- ESP32-C3 can't hold two EPUBs in RAM — single-file bilingual only.
-- 2.4 GHz Wi-Fi only on the device.
-- Device push is best-effort; when the device is unavailable the EPUB remains
-  available through OPDS and the watcher retries queued pushes later.
-
-## Format contract reference
-
-See `~/github/crosspoint-agentdeck/docs/bilingual-epub.md` for the exact
-marker rules the firmware parser (`lib/Epub/Epub/parsers/ChapterHtmlSlimParser.cpp`)
-enforces, and `docs/bilingual-pipeline.md` for the end-to-end architecture.
+Direct device push is off by default. Only use `BABELFORGE_DEVICE_PUSH=1` when the user
+requests that integration. The watcher then retries queued files. Its failure does not
+undo EPUB generation or OPDS publication. The core output needs no CrossPoint firmware,
+font package, network discovery or bilingual-toggle feature. Do not activate device
+integration merely because the user asks for an EPUB.

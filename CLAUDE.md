@@ -1,105 +1,188 @@
 # BabelForge
 
-Public-domain book → **bilingual (original + Korean) EPUB** → **Calibre OPDS** pipeline, with
-best-effort push to an XTeink X3/X4 e-ink reader. Served at **books.foundby.kr**.
+Public-domain books → **portable bilingual EPUB 3 (original + Korean)** → optional
+Calibre/OPDS publication. The output works in ordinary EPUB readers without custom
+firmware, a language toggle, a device font package, or a sibling repository.
 
-A standalone Python project, split out of the `OpenClaw` ops repo on 2026-07-05 (it was never
-tracked there — this repo's history starts fresh). Read this file first; the user-facing
-overview is `README.md`, and the agent runbook is `.agents/skills/book-translator/SKILL.md`.
+This is the architecture and implementation SSOT. The operational procedure is
+[`.agents/skills/book-translator/SKILL.md`](.agents/skills/book-translator/SKILL.md),
+the user overview is `README.md`, and the format contract is `docs/epub-format.md`.
 
 ## Architecture
 
-Single-process Python pipeline, no framework. Every path derives from `__file__`, so the tree
-is **relocatable** (no hardcoded absolute paths — keep it that way).
-
 ```
-request → search (Gutenberg / Standard Ebooks / Anna's / local)
-        → mandatory source research (autonomously prefer a verified public-domain
-                                     original-language edition over relay translation)
-        → fetch source → extract chapters (BeautifulSoup / ebooklib)
-        → structured concept sheet (whole-book candidates → web grounding
-                                    → adjudication → adversarial cross-check
-                                    → enforcement-schema normalization)
-        → GLM precision translation (paragraph-aligned, char-budget-capped batches,
-                                     concurrent workers, semantic proofread,
-                                     HTML-tag + concept distinctions preserved)
-        → fail-closed whole-book terminology audit + contextual repair
-        → assemble bilingual EPUB (cp-original / cp-translation block-level <p> markers)
-        → publish: calibredb add → Calibre Content Server OPDS feed
-        → best-effort HTTP push to the XTeink reader (skipped silently if unreachable)
-        → LINE notify (via the openclaw CLI)
+request → source/edition research → verified original-language candidate if safe
+        → content-validated atomic download → structure-preserving extraction
+        → researched concept sheet → aligned translation + proofreading
+        → semantic + occurrence-aware terminology audits until stable
+        → EPUB assembly → local structural checks + EPUBCheck when installed
+        → completed local EPUB OR Calibre/OPDS publication
+        → optional device delivery and notification
 ```
 
-### Key files (SSOT per concern)
+The pipeline is one Python process per request, with parallel translation batches.
+Request workers have exclusive process locks; catalog and delivery queue updates
+use locked read-modify-write transactions and unique temporary files. State files
+remain JSON-compatible with existing installations. Corrupt state fails visibly
+instead of silently resetting the catalog or queue.
 
-| File | Owns |
+## Components
+
+| File | Responsibility |
 |---|---|
-| `pipeline.py` | Orchestrator — `run()` drives fetch→extract→translate→assemble→publish→push, updating `data/catalog.json`. |
-| `config.py` | **All config + paths.** `BASE_DIR` from `__file__`; `DATA_DIR`/`LIBRARY_DIR`/`CACHE_DIR`/`CHECKPOINT_DIR`/`LOGS_DIR`; ZAI/GLM, Calibre, OPDS, device-push settings. |
-| `search.py` | Catalog search → JSONL candidates; `openclaw message send` LINE notify. |
-| `sources/` | Source adapters (`gutenberg`, `standard_ebooks`, `annas_archive`, `local_file`), dispatched via `sources/__init__.py::get_adapter()`. |
-| `extract.py` | Chapter/paragraph extraction. Plain-text Gutenberg sources recover title-case multilingual chapter headings from an explicit indented TOC; headings stay as bilingual units so structural improvements can reuse aligned checkpoints. |
-| `translate.py` | **GLM translation engine** — the biggest file. System prompt is **inline** (literary-translator). Batch output is aligned by **numbered `[k]` markers** (`_parse_numbered_slots` — GLM keeps an explicit numbered list far more reliably than a lone `⟦P⟧` delimiter); missing slots are back-filled by single-paragraph calls, so a partial/collapsed batch keeps its good paragraphs. Plus batching, backoff, checkpoint resume, 2-pass. Also: **inline-HTML tag stashing** (`_stash_tags`/`_restore_tags` swap `<i>/<b>/<em>/…` for PUA placeholders so GLM can't mangle them), **glossary** enforcement in the system prompt, and **source-side context** (each batch gets the preceding 3 source paragraphs — parallel-safe, keeps tone/terminology steady across concurrent workers, `config.TRANSLATE_WORKERS`). |
-| `precision.py` | **Mandatory precision preflight** — researches original language/title, autonomously replaces a relay catalog source when a verified public-domain original is available, extracts lowercase/multiword and rare lexical-neighbor concepts across the book, gathers web evidence, then runs adjudicator + adversarial critic + enforcement-schema normalization passes. Malformed JSON is repaired autonomously. Writes a structured, request-scoped concept sheet under `data/concepts/`. |
-| `quality_audit.py` | **Fail-closed pre-publication audit** — first independently reviews every final pair for semantic errors, omissions, untranslated quotations, and malformed Korean, then checks every strict source concept occurrence for the canonical Korean term and forbidden variants. It repairs issues through GLM and rejects the book if any remain. A forbidden Korean string may be retained only through an explicit paragraph/concept-scoped contextual review when it translates a different source lemma. A matched spelling may skip the canonical term only when an exact, longer source expression proves a non-conceptual idiom (for example `in Wahrheit` = “실은”); an exact standalone concept term is never exemptible. |
-| `glossary_builder.py` | Legacy standalone flat-glossary utility. The production pipeline no longer uses this best-effort path; `precision.py` owns mandatory structured terminology research. |
-| `mcp_client.py` | Minimal **self-contained MCP (Streamable-HTTP) client** — no Node dependency. Speaks initialize → notifications/initialized → tools/call over urllib against Z.ai MCP servers, authed with the Coding-Plan key. Exposes `web_search(query)`; fails soft (returns `[]`, never raises) so a search hiccup never blocks translation. |
-| `assemble.py` | Builds the bilingual EPUB. Emits **block-level `<p class="cp-original">` / `<p class="cp-translation">` only** — never `<span>` (firmware parser contract). |
-| `publish.py` | `calibredb add` into `~/Calibre-Library`. |
-| `device_push.py` | HTTP POST push to the reader (mDNS/subnet discovery). |
-| `auto_push_watcher.py` + `pending_queue.py` | launchd-driven retry queue for device pushes. |
-| `catalog.py` | `data/catalog.json` state machine (requested → researching → selected → analyzing → translating → quality_checked → assembling → published/failed). |
-| `babelforge_mcp.py` | **Agent-facing MCP server** (FastMCP) — the appliance's front door. Tools: `search_books` / `translate_book` (detached spawn, returns `req_id` immediately) / `retry_request` (same-`req_id` checkpoint resume) / `get_status` / `list_recent`. A thin typed skin over the same functions the CLI uses. Runs streamable-HTTP under launchd `com.local.babelforge-mcp` (`http://127.0.0.1:8770/mcp`, `config.MCP_PORT`); `--http` for the appliance, stdio otherwise. Deploy plist: `deploy/com.local.babelforge-mcp.plist`. |
+| `pipeline.py` | Worker ownership, stage orchestration, source/artifact hashes, validation gate, optional publication and isolated auxiliary delivery. `run(..., publish_output=False)` generates a local EPUB. |
+| `config.py` | Environment-backed settings and all repository paths derived from `__file__`. |
+| `sources/` | Gutenberg, Standard Ebooks, opt-in Anna's Archive and local adapters. `sources/download.py` validates content types/signatures, keys caches by URL and commits content atomically. |
+| `extract.py` | EPUB spine order, linked footnotes, semantic block units, assets and XHTML body templates; TXT front matter and logical chapter preservation. |
+| `epub_markup.py` | Shared inline XHTML sanitization, visible-text extraction and exact ordered tag placeholders. |
+| `precision.py` | Original-title/language research, conservative same-work/author/volume/rights selection, concept drafting, web grounding, adversarial review and normalization. |
+| `translate.py` | Numbered batch alignment, output budgets, retries, inline tags, source context, checkpoints and audit resume. |
+| `quality_audit.py` | Shared fidelity criteria, grounded correction proposals, independent exact-text approval, partial-row recovery, audit ledger, contextual terminology and bounded convergence. |
+| `review_library.py` | Manifest-bound existing-edition review; exact source coverage recovery, retained Korean, source/term audits and resumable local EPUB rebuilds. |
+| `finish_library_review.py` | Final approval/quotation checks, source verse and TOC restoration, metadata, EPUBCheck and local reviewed-library ZIP delivery. |
+| `assemble.py` | Portable EPUB 3, both languages, structured source templates, inline emphasis, images, links, TOC/NCX, provenance and atomic validated output. |
+| `epub_validate.py` | ZIP/XML/manifest/spine/link/anchor/pair checks and optional full EPUBCheck. |
+| `scripts/setup_epubcheck.py` | Installs a pinned official EPUBCheck release after verifying its SHA-256. Requires Java at runtime. |
+| `publish.py` | Stable edition identifiers; replaces an existing EPUB format without deleting its Calibre record, otherwise adds a separate edition. |
+| `publication.py` | Serialized revision promotion, temporary staging, public OPDS acquisition/content/EPUBCheck verification, catalog commit and identity/hash-bound obsolete deletion. No old-edition backups. |
+| `publish_reviewed.py` | Publishes a completed review manifest only after exact final approval and artifact checks; supports a read-only preflight. |
+| `state_store.py`, `catalog.py` | POSIX process locks, atomic state transactions, conditional retry claims and crashed-worker recovery. |
+| `babelforge_mcp.py` | Typed search, detached translation, retry and status tools. Local streamable HTTP on `127.0.0.1:8770/mcp` by default. |
+| `device_push.py`, `pending_queue.py`, `auto_push_watcher.py` | Optional legacy device integration. Disabled by default. |
+| `search.py` | Search routing and optional OpenClaw LINE notifications. |
 
-## Run
+`glossary_builder.py`, `fill_filtered.py`, `build_font.py` and `deliver.py` are
+legacy utilities, not requirements of the standard EPUB path. The old font and
+explicit-device tools may still reference `crosspoint-agentdeck`; generation does not.
+
+## Invariants
+
+- **Secrets:** `.env` is ignored by Git. `config.py` loads `ZAI_API_KEY` or
+  `GLM_API_KEY` without overriding exported environment variables. Never print keys.
+- **Paths:** repository paths derive from `BASE_DIR`; do not hardcode the checkout.
+- **Name research:** retain short CJK lexical/name forms during normalization;
+  statistical candidate-length filters are not lexical-validity rules. Cluster
+  retained-source forms independently from cross-script original/romanized metadata.
+  Primary pronunciation annotations outrank an earlier model's guessed reading.
+- **Source identity:** same author alone never proves same work. Automatic original
+  replacement requires matching work/author/volume and an eligible public-domain
+  source. Uncertain matches retain the selected edition.
+- **Source conservation:** logical chapters and short utterances are not boilerplate.
+  Download cache payloads are content-addressed, so a later fetch cannot replace
+  bytes a running request is already reading. Legacy caches remain readable.
+  EPUB templates bind indexed translation slots to inline XHTML units; images,
+  tables, verse and linked footnotes retain their structure. Unavailable remote
+  media in standalone HTML fails before translation instead of disappearing.
+- **Portable format:** the local contract is `docs/epub-format.md`, based on EPUB 3.
+  `bf-original` / `bf-translation` are CSS hooks, not parser requirements. Do not
+  reintroduce device-driven chapter caps or special-font requirements.
+- **Defaults:** original paragraph boundaries are preserved. Optional sentence
+  units use `BABELFORGE_SENTENCE_SPLIT=1` within the retained source containers.
+  Long blocks use smaller translation units within their original containers to
+  respect model output budgets without deleting or relocating source text.
+- **Checkpoint monotonicity:** batch failures must not replace a nonblank translated
+  slot with a blank. Preserve this guard in `_commit_batch`.
+- **Profile compatibility:** prompt/model/terminology changes invalidate stale work.
+  Verify stored review profile hashes against the actual concept sheet, and
+  bind a review checkpoint to its baseline hash and unchanged source sequence.
+  Matching translation checkpoint headers alone do not authorize misaligned pairs.
+  Structural remapping requires matching source-independent instruction hashes and
+  exact in-order source coverage of at least 95%. Legacy checkpoints without a
+  compatible instruction hash are not silently reused.
+- **Final audit:** every final text must pass deterministic integrity checks.
+  A semantic correction is an **unapproved proposal**, including when the model
+  repeats unchanged text with `action=correct`. Only a separate call returning
+  `keep` for the exact final wording approves it. Up to four semantic review rounds
+  and three semantic/terminology convergence rounds are allowed; conflicts block
+  output. Terminology repairs trigger semantic re-review. Semantic cache signatures
+  bind source + final Korean + adjacent source/Korean context (across chapter
+  boundaries too) + work metadata + model and quality profile. Prompt/audit versions invalidate older approvals.
+- **Grounded edits and recovery:** semantic corrections require a reason and a
+  supporting source quotation; only explicitly classified Korean grammar/spelling
+  repairs may omit the quotation. Numeric/punctuation-only source labels may cite
+  their exact nonalphabetic text; a prose correction may not cite punctuation alone.
+  NFC/elision typography and line-initial book.line reference anchors may
+  normalize for evidence matching, but spelling, accents and inflections may not. Valid verdicts survive a
+  partially malformed response; retry only unresolved rows, up to three attempts.
+  Review batches are bounded by paragraph count, 24,000 serialized input row
+  characters and 6,000 estimated repair/evidence characters (including row overhead);
+  oversized units fail visibly instead of being truncated. No oversized/empty API
+  input is silently submitted. Repairs invalidate neighboring approvals when their
+  context changes; those units must pass again before completion. Checkpoints persist
+  `audit_log` (before/after, evidence, profile, signatures, approval) after each accepted response, including
+  proposals that still need re-review. A failed attempt cannot certify completion.
+  Terminology verdicts also require one unambiguous row per key with integer
+  indices; duplicate rows and coerced boolean/string/fractional indices are rejected.
+- **Legacy label integrity:** reject unexpanded tag/batch markers absent from the
+  source, and substantive prose copied into short numeric/Roman label slots.
+  Preserve author initials such as `J. M.` as identifiers; they are not untranslated
+  sentences. These integrity checks apply even to cached approvals.
+- **Context exceptions:** a phrase exception covers a specific source occurrence,
+  never a separate standalone concept in the same paragraph. Avoided Korean strings
+  also require occurrence-specific exceptions: repeated collisions need separate
+  `ko_start` offsets in plain Korean or one-based `ko_occurrence` indices, so a legitimate ethnonym cannot exempt an
+  unrelated mistranslated name elsewhere in the same paragraph.
+- **Publication:** validate before atomic output replacement and before publication.
+  Compare every original/Korean visible-text pair in EPUB spine order with the
+  approved book, not merely the number of pairs. This is separate from semantic
+  accuracy and EPUBCheck conformance.
+  Keep the canonical Calibre record and acquisition URL when replacing its file.
+  Delete only redundant records with the same stable edition identifier, after
+  public acquisition verification. Delete explicitly identified old local EPUBs
+  only after verification and catalog commit; never use title-based glob deletion.
+  Changed hashes, symlinks, shared other-edition paths and paths outside the managed
+  library block cleanup. Do not retain old EPUB backups. Source text and editorial
+  audit records remain distinct from obsolete deliverable files.
+- **Concurrency:** use catalog/queue transaction helpers; `os.replace()` alone is
+  not a read-modify-write lock. Hold `catalog.request_worker(req_id)` for the run.
+- **Completion:** local output is `completed`; published output is `published`.
+  Revision promotion remains retryable until obsolete cleanup finishes; CLI
+  publication owns the same request lock as normal pipeline workers.
+  Device/notification failures do not regress either state. Retries preserve the
+  stored local-versus-publish choice and notification setting unless explicitly
+  overridden. Legacy records with no notification preference default to silent.
+- **Anna's Archive:** only explicitly selected `annas:` searches may use it.
+- **Structured API:** use provider `response_format=json_object`. Business error
+  `1213` is not a retryable rate-limit error. Empty inputs must not reach the API.
+
+## Validation and development
 
 ```bash
-# search candidates (JSONL, one per line)
-./venv/bin/python3 search.py "<query>" --no-line
-./venv/bin/python3 search.py "annas: <query>" --no-line   # opt-in Anna's Archive
-
-# translate + publish a chosen candidate (save one candidate line to a file)
-export ZAI_API_KEY=<GLM Coding Plan key>
-./start.sh <candidate.json>          # detached; log → logs/pipeline.<ts>.log
-
-# progress
-./venv/bin/python3 -c "import catalog; print(catalog.recent(5))"
+./venv/bin/python3 -m unittest discover -s tests -v
+./venv/bin/python3 scripts/setup_epubcheck.py
+./venv/bin/python3 epub_validate.py /path/to/book.epub
 ```
 
-Full agent runbook (search → pick → translate → deliver): **`.agents/skills/book-translator/SKILL.md`**.
+The setup script installs under `data/tools/`, which is ignored by Git. The validator
+auto-detects that distribution, an `epubcheck` executable, or `EPUBCHECK_JAR`.
+`BABELFORGE_REQUIRE_EPUBCHECK=1` makes absence of the full checker an error. Otherwise
+local structural checks still run and the report explicitly says `not_available`.
 
-## External dependencies (contracts crossing repo boundaries)
+Tests use temporary state, mock model/Calibre calls and concurrency fixtures. They
+must not translate, publish, notify, scan a network or modify production data.
 
-BabelForge is self-contained Python, but leans on four things outside it:
+## Deployment context
 
-| Dependency | For | Contract |
-|---|---|---|
-| **`crosspoint-agentdeck`** (sibling checkout `~/github/crosspoint-agentdeck`) | The **bilingual-EPUB format** is defined there — `docs/bilingual-epub.md` is the **SSOT**. `assemble.py`'s skeleton derives from its `scripts/generate_bilingual_test_epub.py`; `build_font.py` reads its `lib/EpdFont/scripts`. | Producer↔consumer. This pipeline is the **producer**; the reader firmware is the consumer. A format change is breaking on both sides — coordinate via that doc. |
-| **`openclaw` CLI** (`/opt/homebrew/bin/openclaw`) | LINE notifications (`search.py`, `config.py:OPENCLAW_BIN`). | One `openclaw message send` subprocess call — no code dependency. |
-| **Calibre Content Server** (launchd `com.local.calibre-server`, port 8080; cloudflared `com.getlingo.openclaw.cloudflared`) | Hosts the OPDS feed at `books.foundby.kr/opds`. `publish.py` only calls `calibredb add`. The older `books.getlingo.store` route remains as a compatibility alias, but **that domain is due to expire** — generated BabelForge links use `books.foundby.kr`. | External service (KeepAlive launchd). |
-| **ZAI / GLM API** (`api.z.ai`, model `glm-5.2`) | Translation engine. Key from `.env` (`ZAI_API_KEY` or `GLM_API_KEY`) — **never hardcode**. | External API. |
-| **Z.ai MCP** (`api.z.ai/api/mcp/web_search_prime`, tool `web_search_prime`) | Grounds source provenance and concept decisions in external evidence (`precision.py`, `mcp_client.py`). Same Coding-Plan key; MCP is entitled on it independently of REST. | External MCP (Streamable HTTP). Individual searches fail soft; source-context adjudication and an adversarial cross-check remain mandatory. |
+The configured model endpoint is Z.ai (`config.ZAI_MODEL`); web grounding uses its
+MCP search endpoint through `mcp_client.py`. Individual searches fail softly while
+structured source/concept adjudication is mandatory.
 
-## Conventions & gotchas
+Calibre Content Server is optional for local EPUB generation; publication normally
+uses `calibredb` via `http://localhost:8080`. A proven managed read-only local server
+is paused for CLI writes to its matching library and restarted in `finally` before
+public verification. Never grant anonymous writes or edit the LaunchAgent policy.
+A durable maintenance marker permits the next publication to recover a service
+interrupted by process termination. Recovery requires the exact same configuration
+and never starts a manually stopped service with no publisher marker.
+Public feed: `https://books.foundby.kr/opds`. The old `books.getlingo.store`
+route is only a compatibility alias and is due to expire.
 
-- **Secrets:** `.env` holds `GLM_API_KEY` (and optional device host). It is gitignored — never commit it, never print its values. `config.py::_load_dotenv()` populates `os.environ` from this repo's `.env` on import (via `setdefault`, so a real env var wins); the translator then reads the key as `ZAI_API_KEY` or the `GLM_API_KEY` fallback. No key is stored in code.
-- **Relocatable:** all paths come from `BASE_DIR = dirname(abspath(__file__))`. Do not introduce hardcoded `~/github/...` self-paths (references to the *sibling* crosspoint repo are the one allowed home-relative exception).
-- **venv:** was moved wholesale on the split, so `venv/bin/activate` and console-script shebangs hold the stale path. Invoking `venv/bin/python3` **directly** (as `run_request.sh` and the LaunchAgent do) works. If you need `activate`/console scripts, recreate the venv from `requirements.txt`.
-- **launchd:** `auto_push_watcher.py` runs under **`com.local.book-translator-watcher`** (`~/Library/LaunchAgents/…`, `StartInterval` 20s, `--once`). If you move/rename this dir, repoint that plist (6 path occurrences). Logs: `logs/watcher.{out,err}.log`.
-- **EPUB format is a contract:** only block-level `<p>` `cp-original`/`cp-translation`; single-file bilingual (ESP32-C3 can't hold two EPUBs in RAM). Don't emit `<span>` markers.
-- **Anna's Archive** is opt-in only via the `annas:` prefix; default search never touches it (copyright = user's responsibility).
-- **Checkpoint resume never regresses:** a re-queued batch window can mix already-translated paragraphs with blank ones (windows are recomputed each run and can shift, e.g. after a batching change), so if that batch ultimately fails, `_commit_batch` in `translate.py` must never overwrite an already non-blank slot with a blank result. This bit us live — a resumed run's rate-limit failures wiped ~90 previously-good translations before the guard was added. Preserve that invariant if you touch `_commit_batch`.
-- **Structural checkpoint remap is exact and audited:** when a better extractor replaces `Untitled` chunks with real chapters, translations may be remapped only by exact in-order source strings at ≥95% coverage. The current semantic and terminology audits always run afterward.
-- **Precision is mandatory:** there is no fast/best-effort production mode. Concept research failures and unresolved strict-term audit failures stop publication. Checkpoints are keyed by both source hash and precision-profile hash, so terminology/prompt changes intentionally restart stale work.
-- **Strict rules are sense-aware but fail closed:** `avoid_ko` is concept-scoped, not paragraph-global, so `Erkenntniss→인식` may coexist with `Wissen→지식`. The auditor records exact paragraph/concept/string exemptions. A canonical term may be absent only for an independently reviewed, verbatim multiword idiom containing the matched spelling; standalone concept occurrences still fail closed.
-- **Structured JSON uses the provider contract:** precision research and the final audit call Z.ai with `response_format=json_object`. Business error `1213` is a request-parameter error (not a length/rate-limit error); never blindly replay the same invalid body. Empty/malformed responses are repaired only with non-empty wrapped input, then regenerated from the original evidence payload.
-- **Gitignored:** `venv/`, `.env`, `data/`, `logs/`, `__pycache__/` (see `.gitignore`).
+The MCP LaunchAgent is `com.local.babelforge-mcp`. The legacy device watcher is
+`com.local.book-translator-watcher` (20-second interval); it returns without
+network activity unless `BABELFORGE_DEVICE_PUSH=1`. Moving the checkout requires
+updating installed plist paths. No launchd configuration is changed automatically
+by code edits.
 
-## Multi-agent harness
-
-This repo is worked with Claude Code / Codex / OpenClaw. The book-translator procedure is a
-**skill**: canonical copy at `.agents/skills/book-translator/SKILL.md` (Codex auto-discovers
-`.agents/skills/`; Claude Code reaches it via the pointer in `.claude/skills/`). The OpenClaw
-gateway agent discovers a thin pointer under `~/.openclaw/workspace/skills/book-translator/`
-that routes back to this repo's SSOT. **Don't fork the procedure into multiple copies** — edit
-the `.agents/skills/` original.
+Invoke `venv/bin/python3` directly. This venv was moved historically, so activation
+scripts/console-script shebangs may have stale paths; recreate from requirements
+when needed. `.env`, `data/`, `logs/`, `venv/` and caches are ignored by Git.

@@ -99,7 +99,7 @@ def notify_line(message: str) -> bool:
             check=True, timeout=30, env=env,
         )
         return True
-    except subprocess.CalledProcessError as e:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
         sys.stderr.write(f"LINE send failed: {e}\n")
         return False
 

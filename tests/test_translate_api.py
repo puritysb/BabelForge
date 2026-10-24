@@ -24,6 +24,38 @@ class _Response:
 
 
 class TranslateApiTests(unittest.TestCase):
+    def test_read_timeout_retries_without_accepting_partial_response(self):
+        class TimedOutResponse(_Response):
+            def read(self):
+                raise TimeoutError("The read operation timed out")
+        response = _Response({"choices": [{"message": {"content": '{"ok":true}'},
+                                          "finish_reason": "stop"}]})
+        with patch.object(translate.config, "get_zai_api_key", return_value="test"), \
+                patch.object(translate.config, "TRANSLATE_MAX_RETRIES", 2), \
+                patch.object(translate.urllib.request, "urlopen",
+                             side_effect=[TimedOutResponse({}), response]) as request, \
+                patch.object(translate.time, "sleep"):
+            self.assertEqual('{"ok":true}', translate._chat_json([{"role": "user", "content": "Review."}]))
+            self.assertEqual(2, request.call_count)
+
+    def test_repeated_transport_timeouts_fail_after_bounded_retries(self):
+        with patch.object(translate.config, "get_zai_api_key", return_value="test"), \
+                patch.object(translate.config, "TRANSLATE_MAX_RETRIES", 2), \
+                patch.object(translate.urllib.request, "urlopen",
+                             side_effect=TimeoutError("timed out")) as request, \
+                patch.object(translate.time, "sleep"):
+            with self.assertRaisesRegex(translate.TranslationError, "exhausted retries"):
+                translate._chat_json([{"role": "user", "content": "Review."}])
+            self.assertEqual(2, request.call_count)
+
+    def test_nonempty_truncated_output_is_rejected(self):
+        response = _Response({"choices": [{"message": {"content": "[1] 잘린 번역"},
+                                           "finish_reason": "length"}]})
+        with patch.object(translate.config, "get_zai_api_key", return_value="test"), \
+                patch.object(translate.urllib.request, "urlopen", return_value=response):
+            with self.assertRaisesRegex(translate.TranslationError, "truncated"):
+                translate._chat([{"role": "user", "content": "Translate this passage."}])
+
     def test_json_mode_uses_provider_structured_output_contract(self):
         response = _Response({
             "choices": [{

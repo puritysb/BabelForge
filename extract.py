@@ -9,20 +9,19 @@ Cleaning rules:
 - Preserve chapter/TOC structure so assemble.py can rebuild spine
 """
 from __future__ import annotations
-import os
+import copy
+import hashlib
+import posixpath
 import re
 from dataclasses import dataclass, field
-from typing import Optional
+from urllib.parse import unquote, urljoin, urlsplit
+from xml.sax.saxutils import escape
 
-from bs4 import BeautifulSoup
+from lxml import etree
 from sources import SourceText
 import config
 
 
-# Sentence splitter for SENTENCE_LEVEL_SPLIT mode. Splits on . ! ? followed by
-# whitespace + a capital letter / quote. Protects common abbreviations so
-# "Mr. Smith" stays one sentence. Good enough for prose; not perfect for
-# heavy dialogue or legal text.
 # Sentence splitter for SENTENCE_LEVEL_SPLIT mode. Splits on Latin . ! ? OR
 # CJK 。！？followed by whitespace + a capital letter / quote (Latin scripts),
 # or just on 。！？ for Japanese/CJK where there's no capitalization cue.
@@ -44,7 +43,7 @@ def split_sentences(text: str) -> list[str]:
         masked = masked.replace(abbr, abbr.replace(".", "\x00"))
     parts = _SENTENCE_SPLIT.split(masked)
     parts = [p.replace("\x00", ".").strip() for p in parts]
-    parts = [p for p in parts if len(p) > 2]
+    parts = [p for p in parts if p]
     return parts or [text]
 
 
@@ -63,12 +62,15 @@ def _paragraphs_to_units(paragraphs: list[str]) -> list[str]:
 @dataclass
 class Chapter:
     title: str
+    # Every translation unit is an inline XHTML fragment, including escaped TXT.
     paragraphs: list[str] = field(default_factory=list)
+    template: str | None = None
+    assets: dict[str, bytes] = field(default_factory=dict)
 
 
 # Gutenberg's "*** START OF THE PROJECT GUTENBERG EBOOK X ***" / "*** END OF ..."
-GUTEN_START = re.compile(r"\*\*\s*START\s+OF.*?\*\*\*", re.IGNORECASE | re.DOTALL)
-GUTEN_END = re.compile(r"\*\*\s*END\s+OF.*?\*\*\*", re.IGNORECASE | re.DOTALL)
+GUTEN_START = re.compile(r"\*{3}\s*START\s+OF.*?\*{3}", re.IGNORECASE | re.DOTALL)
+GUTEN_END = re.compile(r"\*{3}\s*END\s+OF.*?\*{3}", re.IGNORECASE | re.DOTALL)
 # Credits block that follows the START marker (often duplicated PG boilerplate).
 GUTEN_PRODUCED = re.compile(
     r"^\s*Produced by .*?(?:pgdp\.net|project gutenberg|distributed proofreading)"
@@ -140,12 +142,22 @@ def _toc_headings(raw: str) -> set[str]:
 def _heading_key(value: str) -> str:
     return re.sub(r"[.。:：]+$", "", re.sub(r"\s+", " ", value).strip()).casefold()
 
-# Safety cap: never produce a single chapter so large the ESP32-C3 can't
-# reflow it on Bilingual Toggle without an obvious hitch. Each chunk becomes a
-# separate xhtml in the EPUB spine, keeping section cache size bounded.
-# Units = cp-original/cp-translation PAIRS (sentence or paragraph depending
-# on SENTENCE_LEVEL_SPLIT). Sentences are short, so allow more of them.
-MAX_PARAGRAPHS_PER_CHAPTER = 80
+def _remove_explicit_toc(raw: str) -> str:
+    """Remove only a recognized, indented contents list that we rebuild later."""
+    lines = raw.splitlines(keepends=True)
+    remove: set[int] = set()
+    for index, line in enumerate(lines):
+        if not TOC_LABEL_RE.fullmatch(line.strip()):
+            continue
+        cursor = index + 1
+        while cursor < len(lines) and not lines[cursor].strip():
+            cursor += 1
+        first = cursor
+        while cursor < len(lines) and lines[cursor].strip() and lines[cursor][:1] in {" ", "\t"}:
+            cursor += 1
+        if cursor - first >= 2:
+            remove.update(range(index, cursor))
+    return "".join(line for index, line in enumerate(lines) if index not in remove)
 
 
 def extract(src: SourceText) -> list[Chapter]:
@@ -153,50 +165,396 @@ def extract(src: SourceText) -> list[Chapter]:
         return _extract_epub(src.path)
     if src.format == "txt":
         return _extract_txt(src.path)
+    if src.format == "html":
+        return _extract_html(src)
     raise ValueError(f"unsupported source format: {src.format}")
 
 
-# ─── EPUB ───
+XHTML_NS = "http://www.w3.org/1999/xhtml"
+_BLOCKS = {"body", "p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "li",
+           "blockquote", "section", "article", "td", "th", "dd", "dt", "pre",
+           "figcaption", "caption", "aside", "header", "footer", "ul", "ol",
+           "dl", "table", "thead", "tbody", "tfoot", "tr", "figure", "main",
+           "nav", "address"}
+_OPAQUE = {"svg", "math", "audio", "video", "img"}
+_UNSAFE = {"script", "iframe", "object", "embed", "form", "input", "button",
+           "select", "textarea", "style", "link", "base"}
+
+
+def _local_name(tag) -> str:
+    if not isinstance(tag, str):
+        return ""
+    return (etree.QName(tag).localname if tag.startswith("{") else tag.rsplit(":", 1)[-1]).lower()
+
+
+def _document_body(data: bytes, *, html: bool = False):
+    parser = etree.HTMLParser(no_network=True) if html else etree.XMLParser(
+        resolve_entities=False, no_network=True, recover=False)
+    root = etree.fromstring(data, parser)
+    if root is None:
+        raise ValueError("source document has no content")
+    bodies = root.xpath("//*[local-name()='body']")
+    if not bodies:
+        raise ValueError("source document has no body")
+    body = copy.deepcopy(bodies[0])
+    for node in list(body.iter()):
+        if not isinstance(node.tag, str):
+            parent = node.getparent()
+            if parent is not None:
+                tail = node.tail or ""
+                previous = node.getprevious()
+                if previous is not None:
+                    previous.tail = (previous.tail or "") + tail
+                else:
+                    parent.text = (parent.text or "") + tail
+                parent.remove(node)
+            continue
+        local = _local_name(node.tag)
+        if local in _UNSAFE:
+            parent = node.getparent()
+            if parent is not None:
+                # Preserve text following active elements, but never their code.
+                tail = node.tail or ""
+                previous = node.getprevious()
+                if previous is not None:
+                    previous.tail = (previous.tail or "") + tail
+                else:
+                    parent.text = (parent.text or "") + tail
+                parent.remove(node)
+            continue
+        if not node.tag.startswith("{"):
+            node.tag = f"{{{XHTML_NS}}}{local}"
+        if "srcset" in node.attrib:
+            parent = node.getparent()
+            if node.get("src"):
+                # Keep the packaged fallback image; responsive alternatives
+                # otherwise need a second URL grammar and manifest treatment.
+                del node.attrib["srcset"]
+            elif (local == "source" and parent is not None
+                  and _local_name(parent.tag) == "picture"
+                  and any(_local_name(child.tag) == "img" and child.get("src") for child in parent)):
+                parent.remove(node)
+                continue
+            else:
+                raise ValueError("source has responsive media without a packaged src fallback")
+        for attribute in list(node.attrib):
+            name = _local_name(attribute)
+            value = node.attrib[attribute].strip()
+            if (name.startswith("on") or name.startswith("data-bf-") or name == "style"
+                    or (name in {"href", "src", "action"} and
+                        urlsplit(value).scheme.lower() in {"javascript", "vbscript", "file"})):
+                del node.attrib[attribute]
+            elif ":" in attribute and not attribute.startswith("{"):
+                prefix, name = attribute.split(":", 1)
+                namespace = {"xml": "http://www.w3.org/XML/1998/namespace",
+                             "epub": "http://www.idpf.org/2007/ops",
+                             "xlink": "http://www.w3.org/1999/xlink"}.get(prefix)
+                del node.attrib[attribute]
+                if namespace:
+                    node.set(f"{{{namespace}}}{name}", value)
+    return body
+
+
+def _inline_content(node) -> str:
+    parts = [node.text or ""]
+    # Text needs XML escaping, child serialization already supplies it.
+    parts[0] = escape(parts[0])
+    parts.extend(etree.tostring(child, encoding="unicode", with_tail=True)
+                 for child in node)
+    return "".join(parts)
+
+
+def _bounded_text_chunks(text: str, budget: int, sentence_split: bool = False) -> list[str]:
+    """Split without discarding a single character, preferring natural breaks."""
+    segments = [text]
+    if sentence_split:
+        masked = text
+        for abbreviation in _ABBREVIATIONS:
+            masked = masked.replace(abbreviation, abbreviation.replace(".", "\x00"))
+        ends = [match.end() for match in _SENTENCE_SPLIT.finditer(masked)] + [len(text)]
+        segments = []
+        start = 0
+        for end in ends:
+            if end > start:
+                segments.append(text[start:end])
+                start = end
+    chunks = []
+    for segment in segments:
+        while len(escape(segment)) > budget:
+            low, high = 1, min(len(segment), budget)
+            while low < high:
+                middle = (low + high + 1) // 2
+                if len(escape(segment[:middle])) <= budget:
+                    low = middle
+                else:
+                    high = middle - 1
+            limit = low
+            prefix = segment[:limit]
+            # Forced budget splits need the same abbreviation protection as
+            # optional sentence splitting. Otherwise a long paragraph can end
+            # at Mr./Mrs. and leave its name/relative clause in the next slot.
+            masked_prefix = prefix
+            for abbreviation in _ABBREVIATIONS:
+                masked_prefix = masked_prefix.replace(
+                    abbreviation, abbreviation.replace(".", "\x00"))
+            sentence_breaks = list(re.finditer(
+                r"[.!?。！？](?:\s+|(?=[^\x00-\x7f]))", masked_prefix))
+            whitespace = [match for match in re.finditer(r"\s+", masked_prefix)
+                          if match.start() == 0 or masked_prefix[match.start() - 1] != "\x00"]
+            boundary = (sentence_breaks[-1].end() if sentence_breaks else
+                        whitespace[-1].end() if whitespace else limit)
+            chunks.append(segment[:boundary])
+            segment = segment[boundary:]
+        if segment:
+            chunks.append(segment)
+    return chunks
+
+
+def _mark_units(body, *, sentence_split: bool = False) -> list[str]:
+    """Partition visible source text once, keeping the surrounding XHTML tree."""
+    paragraphs: list[str] = []
+    budget = max(1, int(config.TRANSLATE_BATCH_MAX_CHARS))
+
+    def has_blocks(node):
+        return any(_local_name(child.tag) in _BLOCKS | _OPAQUE
+                   for child in node.iterdescendants())
+
+    def bounded_text(parent, text):
+        for chunk in _bounded_text_chunks(text, budget, sentence_split):
+            if chunk.strip():
+                unit = etree.SubElement(parent, f"{{{XHTML_NS}}}span")
+                unit.text = chunk
+                unit.set("data-bf-unit", str(len(paragraphs)))
+                paragraphs.append(escape(chunk))
+            elif len(parent):
+                parent[-1].tail = (parent[-1].tail or "") + chunk
+            else:
+                parent.text = (parent.text or "") + chunk
+
+    def partition(node):
+        """Keep semantic inline wrappers in place while bounding their text."""
+        if _local_name(node.tag) in _OPAQUE:
+            return
+        children = list(node)
+        text = node.text or ""
+        node.text = None
+        for child in children:
+            node.remove(child)
+        bounded_text(node, text)
+        for child in children:
+            tail = child.tail or ""
+            child.tail = None
+            node.append(child)
+            partition(child)
+            bounded_text(node, tail)
+
+    def mark(node):
+        if "".join(node.itertext()).strip():
+            content = _inline_content(node)
+            if len(content) > budget or sentence_split:
+                partition(node)
+                return
+            node.set("data-bf-unit", str(len(paragraphs)))
+            paragraphs.append(content)
+
+    def visit(node):
+        if _local_name(node.tag) in _OPAQUE:
+            return
+        if not has_blocks(node) and _local_name(node.tag) not in {"body", "ul", "ol", "table", "tr", "dl"}:
+            mark(node)
+            return
+        children = list(node)
+        text = node.text or ""
+        node.text = None
+        for child in children:
+            node.remove(child)
+        group = etree.Element(f"{{{XHTML_NS}}}span")
+        group.text = text
+
+        def flush():
+            nonlocal group
+            if "".join(group.itertext()).strip():
+                node.append(group)
+                mark(group)
+            else:
+                # Even image-only inline runs must remain in the document.
+                if len(group):
+                    node.append(group)
+                elif group.text:
+                    if len(node):
+                        node[-1].tail = (node[-1].tail or "") + group.text
+                    else:
+                        node.text = (node.text or "") + group.text
+            group = etree.Element(f"{{{XHTML_NS}}}span")
+
+        for child in children:
+            tail = child.tail or ""
+            child.tail = None
+            if _local_name(child.tag) in _BLOCKS or has_blocks(child) or _local_name(child.tag) in _OPAQUE:
+                flush()
+                node.append(child)
+                visit(child)
+                group.text = tail
+            else:
+                group.append(child)
+                child.tail = tail
+        flush()
+
+    visit(body)
+    return paragraphs
+
+
+def _document_title(body, fallback: str) -> str:
+    for level in ("h1", "h2", "h3"):
+        nodes = body.xpath(f".//*[local-name()='{level}']")
+        if nodes:
+            text = " ".join("".join(nodes[0].itertext()).split())
+            if text:
+                return text[:200]
+    return fallback
+
+
+def _resolve_local(document: str, reference: str) -> tuple[str | None, str]:
+    parsed = urlsplit(reference)
+    if parsed.scheme or parsed.netloc:
+        return None, parsed.fragment
+    path = posixpath.normpath(posixpath.join(posixpath.dirname(document), unquote(parsed.path))) if parsed.path else document
+    return path, parsed.fragment
+
+
+def _media_reference(node, attribute: str) -> bool:
+    name = _local_name(attribute)
+    return name in {"src", "poster"} or (
+        name == "href" and _local_name(node.tag) in {"image", "use", "feimage"})
+
+
 def _extract_epub(path: str) -> list[Chapter]:
     import ebooklib
     from ebooklib import epub
     book = epub.read_epub(path, options={"ignore_ncx": True})
-    chapters: list[Chapter] = []
-    for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
-        html = item.get_content().decode("utf-8", errors="replace")
-        if not html.strip():
+    documents = {item.get_name(): item for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT)}
+    # EbookLib consumes the manifest's nav property into the EpubNav type on
+    # read, so properties alone misses navigation documents in the spine.
+    navigation = {name for name, item in documents.items()
+                  if isinstance(item, epub.EpubNav)
+                  or "nav" in (getattr(item, "properties", []) or [])}
+    selected = []
+    for identifier, _linear in book.spine:
+        item = book.get_item_with_id(identifier)
+        if item is not None and item.get_name() in documents and item.get_name() not in navigation:
+            if item.get_name() not in selected:
+                selected.append(item.get_name())
+    if not selected:
+        raise ValueError(f"EPUB has no readable spine documents: {path}")
+    bodies = {}
+    # Footnotes are often outside the linear spine. Follow local document links
+    # recursively so their anchors and backlinks survive the rebuilt package.
+    for name in selected:
+        body = _document_body(documents[name].get_content())
+        bodies[name] = body
+        for node in body.iter():
+            for attribute, reference in node.attrib.items():
+                if _local_name(attribute) != "href":
+                    continue
+                target, _fragment = _resolve_local(name, reference)
+                if target in documents and target not in navigation and target not in selected:
+                    selected.append(target)
+    document_paths = {name: f"chapter{index}.xhtml" for index, name in enumerate(selected, 1)}
+    document_paths.update({name: "nav.xhtml" for name in navigation})
+    asset_paths = {}
+    assets = {}
+    media_items = []
+    for item in book.get_items():
+        mime = getattr(item, "media_type", "") or ""
+        if not mime.startswith(("image/", "font/", "audio/", "video/")) and mime not in {"application/vnd.ms-opentype", "application/font-sfnt", "application/font-woff"}:
             continue
-        soup = BeautifulSoup(html, "lxml")
-        # Chapter title: prefer an explicit heading; else use the item name.
-        title = ""
-        for tag in ("h1", "h2", "h3"):
-            h = soup.find(tag)
-            if h and h.get_text(strip=True):
-                title = h.get_text(strip=True)[:200]
-                break
-        if not title:
-            title = (item.get_name() or "Chapter").replace(".xhtml", "").replace(".html", "")
-        paragraphs: list[str] = []
-        for p in soup.find_all(["p", "li"]):
-            text = p.get_text(" ", strip=True)
-            if text and len(text) > 1:
-                paragraphs.append(text)
-        if paragraphs:
-            # Apply sentence-level splitting if enabled (default).
-            units = _paragraphs_to_units(paragraphs)
-            chapters.append(Chapter(title=title, paragraphs=units))
-    if not chapters:
-        raise ValueError(f"no chapters extracted from EPUB: {path}")
+        name = item.get_name()
+        basename = re.sub(r"[^A-Za-z0-9._-]", "_", posixpath.basename(name)) or "asset"
+        target = f"assets/{hashlib.sha256(name.encode()).hexdigest()[:12]}-{basename}"
+        asset_paths[name] = target
+        media_items.append(item)
+    for item in media_items:
+        data = item.get_content()
+        name = item.get_name()
+        if getattr(item, "media_type", "") == "image/svg+xml":
+            tree = etree.fromstring(data, etree.XMLParser(resolve_entities=False, no_network=True))
+            for node in list(tree.iter()):
+                if _local_name(node.tag) == "script":
+                    parent = node.getparent()
+                    if parent is not None:
+                        parent.remove(node)
+                    continue
+                for attribute, reference in list(node.attrib.items()):
+                    if _local_name(attribute).startswith("on"):
+                        del node.attrib[attribute]
+                    elif _local_name(attribute) in {"href", "src"}:
+                        if urlsplit(reference).scheme.lower() in {"javascript", "vbscript", "file"}:
+                            del node.attrib[attribute]
+                            continue
+                        target, fragment = _resolve_local(name, reference)
+                        if _media_reference(node, attribute) and target not in asset_paths:
+                            raise ValueError(f"SVG references missing or external media: {name}: {reference}")
+                        if target in asset_paths and not reference.startswith("#"):
+                            mapped = posixpath.relpath(asset_paths[target], posixpath.dirname(asset_paths[name]))
+                            node.set(attribute, mapped + (f"#{fragment}" if fragment else ""))
+            data = etree.tostring(tree, encoding="utf-8", xml_declaration=True)
+        assets[asset_paths[name]] = data
+    chapters = []
+    for name in selected:
+        body = bodies[name]
+        title = _document_title(body, posixpath.splitext(posixpath.basename(name))[0])
+        for node in body.iter():
+            for attribute, reference in list(node.attrib.items()):
+                if _local_name(attribute) not in {"href", "src", "poster"}:
+                    continue
+                target, fragment = _resolve_local(name, reference)
+                if target is None and _media_reference(node, attribute):
+                    raise ValueError(f"EPUB contains unpackaged external media: {name}: {reference}")
+                mapped = document_paths.get(target) or asset_paths.get(target)
+                if mapped:
+                    node.set(attribute, mapped + (f"#{fragment}" if fragment else ""))
+                elif target is not None and _media_reference(node, attribute) and reference:
+                    raise ValueError(f"EPUB references a missing media resource: {name}: {reference}")
+        paragraphs = _mark_units(body, sentence_split=config.SENTENCE_LEVEL_SPLIT)
+        chapters.append(Chapter(title=title, paragraphs=paragraphs,
+                                template=etree.tostring(body, encoding="unicode"),
+                                assets=dict(assets)))
+    if not any(chapter.paragraphs for chapter in chapters):
+        raise ValueError(f"no text extracted from EPUB: {path}")
     return chapters
+
+
+def _extract_html(src: SourceText) -> list[Chapter]:
+    with open(src.path, "rb") as handle:
+        body = _document_body(handle.read(), html=True)
+    # A single HTML response is not a complete image-bearing book package.
+    # Reject missing media before translation instead of silently losing it.
+    for node in body.iter():
+        if _local_name(node.tag) in _OPAQUE:
+            raise ValueError("standalone HTML contains media; choose the EPUB edition to preserve its resources")
+        for attribute, reference in list(node.attrib.items()):
+            if _local_name(attribute) not in {"href", "src", "poster"}:
+                continue
+            if reference and _media_reference(node, attribute):
+                raise ValueError("standalone HTML references media; choose the EPUB edition to preserve its resources")
+            if reference and not reference.startswith("#") and src.candidate.fetch_url:
+                node.set(attribute, urljoin(src.candidate.fetch_url, reference))
+    title = _document_title(body, src.candidate.title)
+    paragraphs = _mark_units(body, sentence_split=config.SENTENCE_LEVEL_SPLIT)
+    if not paragraphs:
+        raise ValueError(f"no text extracted from HTML: {src.path}")
+    return [Chapter(title=title, paragraphs=paragraphs,
+                    template=etree.tostring(body, encoding="unicode"))]
 
 
 # ─── Plain text ───
 def _extract_txt(path: str) -> list[Chapter]:
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
+    with open(path, "r", encoding="utf-8-sig") as f:
         raw = f.read()
 
     # Slice off the Gutenberg boilerplate if present.
     m = GUTEN_START.search(raw)
+    has_gutenberg_start = m is not None
     if m:
         raw = raw[m.end():]
     m = GUTEN_END.search(raw)
@@ -204,15 +562,19 @@ def _extract_txt(path: str) -> list[Chapter]:
         raw = raw[:m.start()]
     # Strip the duplicated "Produced by ... pgdp.net" credits block that often
     # immediately follows the START marker.
+    if has_gutenberg_start:
+        raw = re.sub(r"\A\s*Produced by\b.*?(?=\n\s*\n|\Z)", "", raw,
+                     count=1, flags=re.I | re.S)
     raw = GUTEN_PRODUCED.sub("", raw, count=1)
     toc_headings = _toc_headings(raw)
+    raw = _remove_explicit_toc(raw)
 
     # Normalize whitespace into paragraphs (blank-line separated).
     # Collapse runs of whitespace inside a paragraph.
     paras: list[str] = []
     for block in re.split(r"\n\s*\n", raw):
         text = re.sub(r"\s+", " ", block).strip()
-        if len(text) > 1:
+        if text:
             paras.append(text)
     if not paras:
         raise ValueError(f"no paragraphs found in txt: {path}")
@@ -225,76 +587,39 @@ def _extract_txt(path: str) -> list[Chapter]:
     # "Front Matter" is publisher jargon; "Preface" / "들어가며" reads better in
     # the device's TOC. The first heading encountered promotes the bucket.
     current = Chapter(title="Preface")
+    chapters.append(current)
+    source_headings: dict[int, str] = {}
     for p in paras:
         from_toc = _heading_key(p) in toc_headings
         is_heading = bool(CHAPTER_RE.fullmatch(p)) or from_toc
         if is_heading:
             current = Chapter(title=p.strip()[:200])
-            # A TOC-derived title was a normal paragraph in older extraction
-            # output. Keep it as the first bilingual unit so checkpoint source
-            # coverage remains stable while the chapter boundary improves.
-            if from_toc:
-                current.paragraphs.append(p)
+            source_headings[id(current)] = p.strip()
             chapters.append(current)
         else:
             current.paragraphs.append(p)
 
-    # Apply sentence-level splitting to each chapter's raw paragraphs.
-    for ch in chapters:
-        ch.paragraphs = _paragraphs_to_units(ch.paragraphs)
-
     # Drop empty chapters (e.g. trailing Preface with no body).
-    chapters = [c for c in chapters if c.paragraphs]
+    chapters = [c for c in chapters if c.paragraphs or id(c) in source_headings]
     if not chapters:
-        chapters = [Chapter(title="Untitled", paragraphs=_paragraphs_to_units(paras))]
+        chapters = [Chapter(title="Untitled", paragraphs=paras)]
 
-    # If the first chapter is short it's almost certainly front-matter
-    # boilerplate — a "Translated by …" credit line, a publication-city block,
-    # a copyright line, or a duplicated Gutenberg header. Merge it into the
-    # next chapter so the TOC opens on a substantive section and the reader
-    # doesn't see a near-empty page right after the cover. Threshold is
-    # generous (≤8 paragraphs) because credit blocks sometimes span a few
-    # short lines. Also forces merge when the title matches a credit pattern
-    # regardless of size.
-    CREDIT_TITLE_RE = re.compile(
-        r"^(TRANSLATED\s+BY|COPYRIGHT|PUBLISHED|BY\s+[A-Z]|DEDICATION|"
-        r"ABOUT\s+THE|COLOPHON|PRODUCED\s+BY)",
-        re.IGNORECASE,
-    )
-    while len(chapters) >= 2:
-        first = chapters[0]
-        is_credit_title = bool(CREDIT_TITLE_RE.match(first.title or ""))
-        is_short = len(first.paragraphs) <= 8
-        if not (is_credit_title or is_short):
-            break
-        # Merge first into second; keep the real section's title.
-        chapters[1].paragraphs = first.paragraphs + chapters[1].paragraphs
-        chapters.pop(0)
-        # Only merge once-or-twice — stop if the new first chapter looks
-        # like real content.
-        if not (is_credit_title or is_short):
-            break
+    # Keep paragraph grouping in the template even when one long paragraph
+    # needs several bounded translation units. The generated heading is the
+    # same navigation label used by plain-text assembly. Actual source headings
+    # are translated; only the fallback label is synthetic and remains unmarked.
+    for chapter in chapters:
+        body = etree.Element(f"{{{XHTML_NS}}}body", nsmap={None: XHTML_NS})
+        source_heading = source_headings.get(id(chapter))
+        if source_heading:
+            etree.SubElement(body, f"{{{XHTML_NS}}}h1").text = source_heading
+        for paragraph in chapter.paragraphs:
+            etree.SubElement(body, f"{{{XHTML_NS}}}p").text = paragraph
+        chapter.paragraphs = _mark_units(body, sentence_split=config.SENTENCE_LEVEL_SPLIT)
+        if chapter.title and not source_heading:
+            heading = etree.Element(f"{{{XHTML_NS}}}h1")
+            heading.text = chapter.title
+            body.insert(0, heading)
+        chapter.template = etree.tostring(body, encoding="unicode")
 
-    # Safety net: split any chapter that's still too big for the device to
-    # reflow quickly. This catches aphorism books / loose-prose sources where
-    # the section detector finds nothing.
-    chapters = _split_oversized(chapters)
     return chapters
-
-
-def _split_oversized(chapters: list[Chapter],
-                     cap: int = MAX_PARAGRAPHS_PER_CHAPTER) -> list[Chapter]:
-    out: list[Chapter] = []
-    for i, ch in enumerate(chapters, 1):
-        if len(ch.paragraphs) <= cap:
-            out.append(ch)
-            continue
-        # Split into cap-sized sub-chapters with a clear (Part N) suffix so the
-        # TOC still reads naturally and the device can paginate them fast.
-        n = len(ch.paragraphs)
-        chunks = [ch.paragraphs[i:i+cap] for i in range(0, n, cap)]
-        total = len(chunks)
-        for j, chunk in enumerate(chunks, 1):
-            title = ch.title if total == 1 else f"{ch.title} (Part {j}/{total})"
-            out.append(Chapter(title=title, paragraphs=chunk))
-    return out

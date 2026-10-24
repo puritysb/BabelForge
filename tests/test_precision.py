@@ -23,6 +23,12 @@ from unittest.mock import patch
 
 
 class PrecisionResearchTests(unittest.TestCase):
+    def test_greek_inflected_forms_do_not_crash_or_disappear(self):
+        forms = _cohesive_source_forms(['Ὀδυσσεύς', 'Ὀδυσῆος'])
+        self.assertTrue(forms)
+        self.assertTrue(set(forms) <= {'Ὀδυσσεύς', 'Ὀδυσῆος'})
+        self.assertEqual(['ἦ', 'ἦ'], _cohesive_source_forms(['ἦ', 'ἦ']))
+
     def test_malformed_json_is_repaired_autonomously(self):
         replies = iter(['{"concepts":[{"broken":',
                         '{"concepts":[{"fixed":true}]}'])
@@ -327,6 +333,27 @@ class PrecisionResearchTests(unittest.TestCase):
 
 
 class QualityAuditTests(unittest.TestCase):
+    def test_avoided_prefix_inside_canonical_is_not_a_violation(self):
+        sheet = {"concepts": [{
+            "concept_id": "troy", "source_terms": ["Τροίην"],
+            "canonical_ko": "트로이아", "avoid_ko": ["트로이"],
+            "strict": True,
+        }]}
+        book = TranslatedBook(title="Test", author="Homer", chapters=[
+            TranslatedChapter(title="I", pairs=[("Τροίην", "트로이아로 갔다.")])])
+        self.assertEqual([], find_violations(book, sheet))
+        book.chapters[0].pairs[0] = ("Τροίην", "트로이아와 트로이로 갔다.")
+        self.assertEqual(["트로이"], find_violations(book, sheet)[0]["avoid_ko_found"])
+
+        def chat(messages):
+            return json.dumps({"corrections": [{
+                "chapter_index": 0, "paragraph_index": 0,
+                "corrected_ko": "트로이아로 갔다.",
+            }]}, ensure_ascii=False)
+
+        self.assertTrue(audit_and_correct(book, sheet, chat)["passed"])
+        self.assertEqual([], find_violations(book, sheet))
+
     def test_whole_book_audit_repairs_untranslated_quote_and_korean_typo(self):
         book = TranslatedBook(
             title="Test", author="N",
@@ -341,16 +368,21 @@ class QualityAuditTests(unittest.TestCase):
         def chat(messages):
             payload = json.loads(messages[1]["content"])
             self.assertEqual(2, len(payload["paragraphs"]))
+            if payload["paragraphs"][0]["current_ko"].startswith("슬픔"):
+                return json.dumps({"paragraphs": [
+                    {"chapter_index": 0, "paragraph_index": i, "action": "keep"}
+                    for i in range(2)]})
             return json.dumps({"paragraphs": [{
                 "chapter_index": 0, "paragraph_index": 0,
                 "action": "correct",
                 "corrected_ko": "슬픔은 인식이며, 인식은 상처를 입힌다.",
                 "reason": "영어 인용문이 미번역 상태다.",
+                "source_quote": "Sorrow is knowledge, and knowledge wounds.",
             }, {
                 "chapter_index": 0, "paragraph_index": 1,
                 "action": "correct",
                 "corrected_ko": '"비도덕적"은 뒤처진 자를 가리킨다.',
-                "reason": "한국어 오탈자를 바로잡았다.",
+                "reason": "한국어 오탈자를 바로잡았다.", "category": "korean",
             }]}, ensure_ascii=False)
 
         report = audit_translation_quality(book, chat, chunk_size=2)

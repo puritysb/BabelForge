@@ -2,7 +2,7 @@
 
 Tries Project Gutenberg (when the source is Gutenberg), then Google Books
 (best title/author coverage, high-quality thumbnails), then Open Library.
-Returns raw JPEG bytes ready to drop into the EPUB, or None if nothing found.
+Returns raw JPEG, PNG or GIF bytes ready to drop into the EPUB, or None.
 """
 from __future__ import annotations
 import os
@@ -22,8 +22,11 @@ def _fetch_image(url: str, timeout: float = 15.0) -> Optional[bytes]:
         r = requests.get(url, timeout=timeout,
                          headers={"User-Agent": "OpenClaw-book_translator/0.1"})
         if r.status_code == 200 and len(r.content) > 1024:
-            ctype = r.headers.get("content-type", "").lower()
-            if "image" in ctype or url.lower().endswith((".jpg", ".jpeg", ".png")):
+            # CDN error pages can retain an image Content-Type or .jpg URL;
+            # other image formats are unsupported by the EPUB cover assembler.
+            # Treat both as a missing candidate so the next source can be tried.
+            if r.content.startswith((b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n",
+                                     b"GIF87a", b"GIF89a")):
                 return r.content
     except requests.RequestException:
         pass
@@ -96,7 +99,7 @@ def from_open_library(title: str, author: str = "") -> Optional[bytes]:
 def find_cover(title: str, author: str = "",
                source: str = "", source_id: str = "",
                extra: dict | None = None) -> Optional[bytes]:
-    """Try sources in best-first order. Returns JPEG/PNG bytes or None."""
+    """Try sources in best-first order. Returns JPEG/PNG/GIF bytes or None."""
     extra = extra or {}
     # 1. Project Gutenberg direct (cheapest + authoritative for PG books).
     if source == "gutenberg":

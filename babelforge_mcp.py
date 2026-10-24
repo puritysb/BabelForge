@@ -42,30 +42,36 @@ def _candidate_to_dict(c) -> dict:
     return dataclasses.asdict(c) if dataclasses.is_dataclass(c) else dict(c)
 
 
-def _spawn_pipeline(candidate: dict, req_id: str, notify: bool) -> dict:
+def _spawn_pipeline(candidate: dict, req_id: str, notify: bool,
+                    publish_output: bool = True) -> dict:
     """Persist input and launch one detached pipeline process for ``req_id``."""
-    config.ensure_dirs()
-    fd, cand_path = tempfile.mkstemp(prefix=f"cand_{req_id}_", suffix=".json",
-                                     dir=config.CACHE_DIR)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(candidate, f, ensure_ascii=False)
-
-    os.makedirs(config.LOGS_DIR, exist_ok=True)
-    log_path = os.path.join(config.LOGS_DIR, f"pipeline.{req_id}.log")
-    argv = [config.VENV_PYTHON, "pipeline.py", cand_path, req_id]
-    if not notify:
-        argv.append("--no-notify")
-    with open(log_path, "a", encoding="utf-8") as logf:
-        process = subprocess.Popen(
-            argv, cwd=config.BASE_DIR, env=os.environ.copy(),
-            stdout=logf, stderr=logf, start_new_session=True,
-            close_fds=True,
-        )
-    catalog.update(req_id, selected=candidate, worker_pid=process.pid,
-                   error=None)
+    try:
+        config.ensure_dirs()
+        fd, cand_path = tempfile.mkstemp(prefix=f"cand_{req_id}_", suffix=".json",
+                                         dir=config.CACHE_DIR)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(candidate, f, ensure_ascii=False)
+        os.makedirs(config.LOGS_DIR, exist_ok=True)
+        log_path = os.path.join(config.LOGS_DIR, f"pipeline.{req_id}.log")
+        argv = [config.VENV_PYTHON, "pipeline.py", cand_path, req_id]
+        if not notify:
+            argv.append("--no-notify")
+        if not publish_output:
+            argv.append("--no-publish")
+        with open(log_path, "a", encoding="utf-8") as logf:
+            process = subprocess.Popen(
+                argv, cwd=config.BASE_DIR, env=os.environ.copy(),
+                stdout=logf, stderr=logf, start_new_session=True,
+                close_fds=True,
+            )
+    except Exception as exc:
+        catalog.update(req_id, status="failed", error=f"worker launch failed: {exc}",
+                       worker_pid=None, worker_claimed_ms=None)
+        raise
+    catalog.record_worker_spawn(req_id, process.pid)
     return {
         "req_id": req_id,
-        "status": "translating",
+        "status": "launching",
         "title": candidate.get("title", "") or "(untitled)",
         "log": log_path,
         "worker_pid": process.pid,
@@ -91,57 +97,42 @@ def search_books(query: str, limit_per_source: int = 5) -> list[dict]:
 
 
 @mcp.tool()
-def translate_book(candidate: dict, notify: bool = True) -> dict:
-    """Start translating + publishing a candidate returned by search_books().
+def translate_book(candidate: dict, notify: bool = True,
+                   publish_output: bool = True) -> dict:
+    """Create a bilingual EPUB, optionally publishing it through Calibre/OPDS.
 
     Returns IMMEDIATELY with a req_id; the full precision pipeline (source and
     original-edition research → concept-sheet web grounding + adversarial
     cross-check → semantic translation/proofread → fail-closed whole-book audit
-    → EPUB → Calibre/OPDS → device push) runs detached. Poll get_status(req_id)
+    → validated EPUB → optional Calibre/OPDS) runs detached. Poll get_status(req_id)
     for progress. Translation is checkpointed against both source text and the
     precision profile, so stale terminology decisions are never reused.
+    Set publish_output=False to save a validated local EPUB without Calibre.
+    Device delivery requires separate explicit configuration; it is disabled by default.
     """
     title = candidate.get("title", "") or "(untitled)"
     req_id = catalog.new_request(title)
-    return _spawn_pipeline(candidate, req_id, notify)
+    catalog.prepare_worker(req_id, candidate, publish_output, notify=notify)
+    return _spawn_pipeline(candidate, req_id, notify, publish_output)
 
 
 @mcp.tool()
-def retry_request(req_id: str, notify: bool = True) -> dict:
+def retry_request(req_id: str, notify: bool | None = None,
+                  publish_output: bool | None = None) -> dict:
     """Resume one failed translation using the same request and checkpoints.
 
-    This is the approval-free recovery path for agents. It deliberately accepts
-    only a terminal failed request so an agent cannot accidentally start two
-    writers for the same checkpoint. Source resolution, concept sheets, and
-    translated batches already persisted under ``req_id`` are reused.
+    Failed requests and requests whose detached worker has exited can resume.
+    The claim and worker lock prevent two checkpoint writers. Omit
+    publish_output and notify to preserve the original output and notification
+    choices. Older requests without a notification choice remain silent.
     """
+    try:
+        candidate = catalog.claim_retry(req_id, publish_output=publish_output, notify=notify)
+    except (KeyError, ValueError, catalog.RequestAlreadyRunning) as exc:
+        return {"error": str(exc), "req_id": req_id}
     record = catalog.get(req_id)
-    if not record:
-        return {"error": f"no request with id {req_id!r}"}
-    if record.get("status") != "failed":
-        return {
-            "error": "only failed requests can be retried",
-            "req_id": req_id,
-            "status": record.get("status"),
-        }
-    candidate = record.get("selected")
-    if not isinstance(candidate, dict):
-        return {
-            "error": "failed request has no persisted candidate",
-            "req_id": req_id,
-        }
-    catalog.update(
-        req_id,
-        status="requested",
-        error=None,
-        progress=None,
-        concept_sheet_path=None,
-        concepts=None,
-        precision_profile=None,
-        quality_report=None,
-        retry_count=int(record.get("retry_count") or 0) + 1,
-    )
-    result = _spawn_pipeline(candidate, req_id, notify)
+    result = _spawn_pipeline(candidate, req_id, record.get("notify") is True,
+                             record.get("publish_output", True))
     result["status"] = "retrying"
     return result
 
@@ -152,13 +143,17 @@ def get_status(req_id: str | None = None) -> dict:
 
     Pass a req_id from translate_book(); omit it to get the most recent request.
     Returns the catalog record (status, progress %, epub_path/opds_url when
-    published, error when failed).
+    published or completed, error when failed). Dead workers are marked failed
+    so the same request can resume through retry_request.
     """
     if req_id:
-        rec = catalog.get(req_id)
-        return rec or {"error": f"no request with id {req_id!r}"}
+        try:
+            return catalog.reconcile_worker(req_id)
+        except KeyError:
+            return {"error": f"no request with id {req_id!r}"}
     recent = catalog.recent(1)
-    return recent[0] if recent else {"error": "no requests yet"}
+    return (catalog.reconcile_worker(recent[0]["id"])
+            if recent else {"error": "no requests yet"})
 
 
 @mcp.tool()

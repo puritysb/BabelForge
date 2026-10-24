@@ -9,8 +9,8 @@ cadence (~1 minute). Each run:
   4. Successful pushes are removed from the queue; LINE notification sent.
   5. Unreachable → no-op (the next run will try again).
 
-The watcher is stateless and safe to run concurrently with pipeline.py —
-both touch pending-push.json only via pending_queue's atomic writes.
+The watcher holds a process lock while draining. Queue mutations use locked
+transactions, so concurrent pipeline enqueues are preserved.
 """
 from __future__ import annotations
 import os
@@ -19,12 +19,26 @@ import time
 import subprocess
 
 import config
+import catalog
 import pending_queue
+from state_store import file_lock
 import search as search_mod  # for notify_line
 from device_push import discover_device, push_to_device
 
 
 def drain_once(verbose: bool = False) -> dict:
+    empty = {"queued": 0, "discovered": False, "pushed": 0, "failed": 0,
+             "ip": None, "source": None}
+    if not config.DEVICE_PUSH_ENABLED:
+        return {**empty, "disabled": True}
+    try:
+        with file_lock(os.path.join(config.DATA_DIR, ".push-watcher.lock"), blocking=False):
+            return _drain_once(verbose)
+    except BlockingIOError:
+        return {**empty, "busy": True}
+
+
+def _drain_once(verbose: bool = False) -> dict:
     """One pass: discover device, push all pending books if found.
 
     Returns a summary dict: {queued, discovered, pushed, failed, ip, source}.
@@ -50,16 +64,20 @@ def drain_once(verbose: bool = False) -> dict:
     summary["ip"] = ip
     summary["source"] = source
     log(f"[watcher] device at {ip} ({source}); pushing {len(pending)} book(s)\n")
-    # Announce the batch start so the user has real-time feedback on LINE
-    # (the device's own screen shows upload progress too, but a phone ping is
-    # less ambiguous than watching the e-ink refresh).
-    search_mod.notify_line(
-        f"📤 기기 전송 시작 ({len(pending)}권, 기기 {ip})\n"
-        f"File Transfer 모드를 유지해 주세요…"
-    )
+    # Legacy entries without an explicit notification choice remain silent.
+    notify_total = sum(item.get("notify") is True for item in pending)
+    if notify_total:
+        search_mod.notify_line(
+            f"📤 기기 전송 시작 ({notify_total}권, 기기 {ip})\n"
+            f"File Transfer 모드를 유지해 주세요…"
+        )
 
     pushed_titles = []
+    notified_failed = notify_index = 0
     for i, item in enumerate(pending, 1):
+        should_notify = item.get("notify") is True
+        if should_notify:
+            notify_index += 1
         epub = item.get("epub_path")
         if not epub or not os.path.isfile(epub):
             pending_queue.remove(epub)
@@ -69,24 +87,31 @@ def drain_once(verbose: bool = False) -> dict:
         result = push_to_device(epub)
         pending_queue.increment_attempts(epub)
         if result.pushed:
+            if item.get("req_id"):
+                # Report the eventual result through the same MCP status record.
+                try:
+                    catalog.update(item["req_id"], device_push=result.to_dict())
+                except (KeyError, OSError, RuntimeError) as exc:
+                    sys.stderr.write(f"[watcher] could not record delivery: {exc}\n")
             pending_queue.remove(epub)
             summary["pushed"] += 1
             title = item.get("title") or os.path.basename(epub)
-            pushed_titles.append(title)
             log(f"[watcher] ✓ pushed {epub}\n")
-            # Per-book progress ping (only meaningful when there's >1 book,
-            # but cheap enough to always send).
-            search_mod.notify_line(
-                f"  [{i}/{len(pending)}] ✓ {title} ({size_kb} KB, "
-                f"{result.elapsed_ms}ms)"
-            )
+            if should_notify:
+                pushed_titles.append(title)
+                search_mod.notify_line(
+                    f"  [{notify_index}/{notify_total}] ✓ {title} ({size_kb} KB, "
+                    f"{result.elapsed_ms}ms)"
+                )
         else:
             summary["failed"] += 1
             log(f"[watcher] ✗ {epub}: {result.error}\n")
-            search_mod.notify_line(
-                f"  [{i}/{len(pending)}] ✗ {item.get('title','?')[:40]} — "
-                f"{result.error[:60]}"
-            )
+            if should_notify:
+                notified_failed += 1
+                search_mod.notify_line(
+                    f"  [{notify_index}/{notify_total}] ✗ {item.get('title','?')[:40]} — "
+                    f"{(result.error or 'unknown error')[:60]}"
+                )
             # If the device vanished mid-batch, stop trying further books.
             if result.skipped:
                 log("[watcher] device disappeared — stopping this pass\n")
@@ -98,9 +123,9 @@ def drain_once(verbose: bool = False) -> dict:
                f"\n기기 /Books 폴더를 확인하세요 (총 {len(pushed_titles)}권). "
                f"File Transfer 모드를 빠져나가 읽으실 수 있습니다.")
         search_mod.notify_line(msg)
-    elif summary["failed"]:
+    elif notified_failed:
         search_mod.notify_line(
-            f"⚠️ 전송 실패 ({summary['failed']}권). 기기가 File Transfer "
+            f"⚠️ 전송 실패 ({notified_failed}권). 기기가 File Transfer "
             f"모드인지 확인 후 다시 둬 주세요 — 다음 폴링에 재시도합니다."
         )
     return summary

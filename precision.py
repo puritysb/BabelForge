@@ -11,15 +11,17 @@ import hashlib
 import json
 import re
 import sys
+import unicodedata
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, is_dataclass
 from difflib import SequenceMatcher
 from typing import Callable
+from epub_markup import plain_text
 
 
 PRECISION_SCHEMA_VERSION = 1
-PRECISION_PROFILE_VERSION = "precision-v1"
+PRECISION_PROFILE_VERSION = "precision-v2-unicode"
 MAX_CONCEPTS = 24
 MAX_WEB_CONCEPTS = 12
 _DISTINCT_ROLE_HINTS = ("denker", "thinker", "penseur")
@@ -29,7 +31,7 @@ class PrecisionError(RuntimeError):
     pass
 
 
-_LATIN_WORD = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ'’-]{2,}")
+_LEXICAL_WORD = re.compile(r"[^\W\d_](?:[^\W\d_]|['’ʼ-]){2,}")
 _COMMON = frozenset(
     "the and for that with this from have not but are was were been being into "
     "than then there their they them his her she him you your our out who what "
@@ -217,31 +219,55 @@ def choose_original_candidate(candidate, research: dict,
     title = str(research.get("original_title") or cand.get("title") or "")
     author = str(cand.get("author") or "")
     candidates = candidate_search_fn(f"{title} {author}".strip()) or []
-    author_tokens = {t.lower() for t in _LATIN_WORD.findall(author)
-                     if t.lower() not in _COMMON}
-    title_tokens = {t.lower() for t in _LATIN_WORD.findall(title)
-                    if t.lower() not in _COMMON}
+    def words(value: str) -> list[str]:
+        return re.findall(r"[^\W\d_]+", unicodedata.normalize("NFKC", value).casefold())
+
+    def author_words(value: str) -> set[str]:
+        return {word for word in words(value) if len(word) > 1}
+
+    def work_title(value: str) -> tuple[str, ...]:
+        # Only an explicitly separated subtitle may vary. A shared word, or
+        # merely a shared author, is not evidence of work identity.
+        return tuple(words(re.split(r"[:：;]", value, maxsplit=1)[0]))
+
+    def volumes(value: str) -> tuple[str, ...]:
+        markers = re.findall(
+            r"\b(?:vol(?:ume)?s?\.?|parts?|books?|band|bd\.?|teil|tome|tomo|libro)"
+            r"\s*([0-9]+|[ivxlcdm]+|one|two|three|first|second|third)\b",
+            value, re.I)
+        markers += re.findall(r"第?\s*([0-9一二三四五六七八九十]+)\s*[巻卷部]", value)
+        numbers = {"i": "1", "ii": "2", "iii": "3", "iv": "4", "v": "5",
+                   "one": "1", "first": "1", "two": "2", "second": "2",
+                   "three": "3", "third": "3", "一": "1", "二": "2", "三": "3"}
+        return tuple(numbers.get(item.casefold(), item.casefold()) for item in markers)
+
+    author_tokens = author_words(author)
+    expected_title = work_title(title)
+    # Research can normalize the title, but cannot silently lose the selected
+    # volume. An unspecified whole work never matches an explicitly split part.
+    selected_volumes = volumes(str(cand.get("title") or ""))
+    original_volumes = volumes(title)
+    if selected_volumes and original_volumes and selected_volumes != original_volumes:
+        return cand, False
+    expected_volumes = selected_volumes or original_volumes
+    if not author_tokens or not expected_title:
+        return cand, False
 
     scored: list[tuple[float, dict]] = []
     for item in candidates:
         d = _as_dict(item)
         if _normalise_lang(d.get("language")) != original_lang:
             continue
-        score = 10.0
-        item_author = str(d.get("author") or "").lower()
-        author_match = any(token in item_author for token in author_tokens)
-        if author_match:
-            score += 5.0
-        item_title_tokens = {t.lower() for t in _LATIN_WORD.findall(
-            str(d.get("title") or ""))}
-        title_overlap = (len(title_tokens & item_title_tokens) / len(title_tokens)
-                         if title_tokens else 0.0)
-        if title_tokens:
-            score += 5.0 * title_overlap
-        if not author_match and title_overlap < 0.5:
+        if (d.get("source") not in {"gutenberg", "standard_ebooks"}
+                or str(d.get("rights") or "").strip().casefold() != "public domain"):
             continue
-        if d.get("rights") == "public domain":
-            score += 1.0
+        item_author = author_words(str(d.get("author") or ""))
+        if not author_tokens.issubset(item_author):
+            continue
+        item_title = str(d.get("title") or "")
+        if work_title(item_title) != expected_title or volumes(item_title) != expected_volumes:
+            continue
+        score = 1.0 if item_author == author_tokens else 0.0
         scored.append((score, d))
     if not scored:
         return cand, False
@@ -260,7 +286,7 @@ def choose_original_candidate(candidate, research: dict,
 def _book_text(chapters: list) -> str:
     return "\n\n".join(
         str(getattr(ch, "title", "")) + "\n" +
-        "\n".join(str(p) for p in getattr(ch, "paragraphs", []))
+        "\n".join(plain_text(str(p)) for p in getattr(ch, "paragraphs", []))
         for ch in chapters
     )
 
@@ -299,7 +325,7 @@ def _representative_sample(chapters: list, max_chars: int = 30000) -> str:
 
 def extract_repeated_phrases(text: str, limit: int = 45) -> list[dict]:
     """Find lowercase multiword terms as well as capitalized proper names."""
-    tokens = _LATIN_WORD.findall(re.sub(r"<[^>]+>", " ", text))
+    tokens = _LEXICAL_WORD.findall(re.sub(r"<[^>]+>", " ", text))
     lowered = [t.lower().strip("-'’") for t in tokens]
     counts: Counter[str] = Counter()
     display: dict[str, str] = {}
@@ -419,7 +445,10 @@ def _cohesive_source_forms(forms: list[str]) -> list[str]:
     """
     if len(forms) < 2:
         return forms
-    tokenised = [(form, _LATIN_WORD.findall(form)) for form in forms]
+    # Candidate-frequency token thresholds must not delete short valid lemmas
+    # (e.g. Japanese 迷亭 / 独仙 or Greek particles) during schema validation.
+    lexical = re.compile(r"[^\W\d_](?:[^\W\d_]|['’ʼ-])*")
+    tokenised = [(form, lexical.findall(form)) for form in forms]
     multi = [(form, tokens) for form, tokens in tokenised if len(tokens) > 1]
     if multi:
         heads = [tokens[-1] for _, tokens in multi]
@@ -471,6 +500,8 @@ def _cohesive_source_forms(forms: list[str]) -> list[str]:
                 break
         else:
             clusters.append([index])
+    if not clusters:
+        return forms  # Short/non-lexical forms have no safe heuristic family.
     chosen = max(clusters, key=lambda cluster: (len(cluster), -cluster[0]))
     base_length = min(len(words[index][1]) for index in chosen)
     return [words[index][0] for index in chosen
@@ -479,7 +510,7 @@ def _cohesive_source_forms(forms: list[str]) -> list[str]:
 
 def _lemma_signatures(concept: dict) -> list[str]:
     return [
-        re.sub(r"[^a-zà-öø-ÿ]", "", form.casefold())
+        "".join(ch for ch in unicodedata.normalize("NFC", form.casefold()) if ch.isalpha())
         for form in (_form_list(concept.get("source_terms"))
                      + _form_list(concept.get("original_terms")))
         if form.strip()
@@ -528,7 +559,7 @@ def _related_lexical_candidates(text: str, concepts: list[dict],
     Freigeist versus Freidenker), so a once-used term can be more important than
     the thirtieth most frequent noun.
     """
-    tokens = Counter(_LATIN_WORD.findall(re.sub(r"<[^>]+>", " ", text)))
+    tokens = Counter(_LEXICAL_WORD.findall(re.sub(r"<[^>]+>", " ", text)))
     known = {
         form.casefold()
         for concept in concepts
@@ -540,7 +571,7 @@ def _related_lexical_candidates(text: str, concepts: list[dict],
         for concept in concepts
         for form in (_form_list(concept.get("source_terms"))
                      + _form_list(concept.get("original_terms")))
-        for token in _LATIN_WORD.findall(form)
+        for token in _LEXICAL_WORD.findall(form)
     }
     ranked: list[tuple[tuple[int, float, int, int], dict]] = []
     seen: set[str] = set()
@@ -569,7 +600,7 @@ def _related_lexical_candidates(text: str, concepts: list[dict],
     for concept in concepts:
         forms = (_form_list(concept.get("source_terms"))
                  + _form_list(concept.get("original_terms")))
-        single = [form for form in forms if len(_LATIN_WORD.findall(form)) == 1]
+        single = [form for form in forms if len(_LEXICAL_WORD.findall(form)) == 1]
         if single:
             # The shortest supplied lemma is usually the base form (Freigeist),
             # while longer forms are inflections (Freigeister/Freigeistes).
@@ -741,7 +772,9 @@ def _validate_concepts(raw: list, full_text: str,
         if has_complete_form:
             forms = [v for v in forms
                      if " " in v or v[:1].isupper() or "-" in v]
-        cohesive = set(_cohesive_source_forms(forms + original_terms))
+        # Original-language/romanized metadata can use another script and
+        # cannot determine the lexical family of the retained source forms.
+        cohesive = set(_cohesive_source_forms(forms))
         forms = [form for form in forms if form in cohesive]
         forms = [v for v in forms if v.casefold() not in seen_forms]
         canonical = str(item.get("canonical_ko") or "").strip()
@@ -808,6 +841,10 @@ def build_concept_sheet(chapters: list, title: str, author: str,
     adjudicated = _call_json(
         chat_fn,
         "You are a senior Korean literary translator adjudicating terminology. "
+        "Translate the retained source edition. Original-language equivalents are "
+        "context, not permission to silently replace a relay edition with another "
+        "wording. In explicit family context, English wife must retain spouse sense "
+        "even if an original German title uses Weib. "
         "Use the source contexts first, then reliable primary editions, library "
         "catalogs, scholarly sources, and established Korean editions in the web "
         "evidence. Do not treat search-result frequency as authority. Preserve "
@@ -862,6 +899,8 @@ def build_concept_sheet(chapters: list, title: str, author: str,
                          or criticised.get("proposed_concepts") or [])
     reviewed = _validate_concepts(reviewed_concepts, full_text, allowed_urls)
 
+    mandatory_related = [candidate for candidate in related
+                         if _is_distinct_role_neighbor(_first_source_term(candidate))]
     # Final schema normalization is distinct from philological adjudication.
     # It prevents a sound decision from becoming an unsafe mechanical rule via
     # adjective fragments, anaphors, or slash-separated target alternatives.
@@ -877,7 +916,8 @@ def build_concept_sheet(chapters: list, title: str, author: str,
         "into separate concept objects with their own mappings. Preserve rare "
         "but intentionally distinct neighboring lemmas. Keep rationales under "
         "40 words and do not add concepts unsupported by the source.",
-        json.dumps({"concepts": reviewed, "source_contexts": contexts},
+        json.dumps({"concepts": reviewed, "source_contexts": contexts,
+                    "required_source_forms": [_first_source_term(c) for c in mandatory_related]},
                    ensure_ascii=False),
         "concept schema normalization",
     )
@@ -885,25 +925,36 @@ def build_concept_sheet(chapters: list, title: str, author: str,
         normalised.get("concepts") or normalised.get("proposed_concepts") or [],
         full_text, allowed_urls)
     final = _reconcile_lexical_targets(final)
-    final_forms = {
-        form.casefold()
-        for concept in final
-        for form in _form_list(concept.get("source_terms"))
-    }
-    mandatory_related = [
-        candidate for candidate in related
-        if _is_distinct_role_neighbor(_first_source_term(candidate))
-    ]
-    missing_related = [
-        _first_source_term(candidate)
-        for candidate in mandatory_related
-        if _first_source_term(candidate).casefold() not in final_forms
-    ]
-    if missing_related:
-        raise PrecisionError(
-            "concept normalization dropped vetted lexical distinctions: "
-            + ", ".join(missing_related)
-        )
+    for repair_attempt in range(3):
+        final_forms = {form.casefold() for concept in final
+                       for form in _form_list(concept.get("source_terms"))}
+        missing_related = [_first_source_term(c) for c in mandatory_related
+                           if _first_source_term(c).casefold() not in final_forms]
+        if not missing_related:
+            break
+        if repair_attempt == 2:
+            raise PrecisionError(
+                "concept normalization dropped vetted lexical distinctions: "
+                + ", ".join(missing_related))
+        repaired = _call_json(
+            chat_fn,
+            "Repair a concept sheet that omitted required source-attested lexical "
+            "distinctions. Return the FULL concepts array, preserving existing valid "
+            "entries and adding a separate entry for every required_source_form. "
+            "Use source contexts and scholarly evidence to decide one Korean "
+            "canonical target for each. Keep exact source spellings, including "
+            "hyphens and plural endings. Do not replace the required forms with "
+            "a related base lemma or merge thinker roles into spirit/mind. "
+            "Respect the 24-entry limit, short rationales and the existing schema. "
+            "Context-dependent mappings must use strict=false. JSON only.",
+            json.dumps({"concepts": final,
+                        "required_source_forms": missing_related,
+                        "previous_adjudication": reviewed,
+                        "source_contexts": _contexts(full_text, missing_related),
+                        "web_evidence": web_evidence}, ensure_ascii=False),
+            "missing lexical distinctions repair")
+        final = _reconcile_lexical_targets(_validate_concepts(
+            repaired.get("concepts") or [], full_text, allowed_urls))
     if drafts and not final:
         raise PrecisionError("concept normalization produced no usable concepts")
     sheet = {

@@ -24,8 +24,9 @@
 - **비밀정보:** `.env`(`GLM_API_KEY`)는 gitignore. 커밋·출력 금지. `config.py` 는 env 로만 읽음.
 - **경로 이식성:** 모든 경로는 `__file__` 기반(`BASE_DIR`). 자기 경로를 하드코딩하지 말 것
   (형제 레포 `crosspoint-agentdeck` 참조만 home-relative 예외).
-- **EPUB 포맷 = 계약:** 블록 레벨 `<p class="cp-original">`/`cp-translation` 만. `<span>` 금지.
-  포맷 SSOT 는 `~/github/crosspoint-agentdeck/docs/bilingual-epub.md`(소비자=e-ink 펌웨어).
+- **EPUB 포맷 = 계약:** 일반 EPUB 3 기반. 포맷 SSOT는 [`docs/epub-format.md`](docs/epub-format.md).
+  의미 구조·원문·번역·언어·각주 링크를 보존하며 특정 펌웨어/전용 폰트를 요구하지 말 것.
+  기기 전송은 `BABELFORGE_DEVICE_PUSH=1`로 명시적으로 켠 경우에만 동작.
 - **launchd:** `com.local.book-translator-watcher` 가 `auto_push_watcher.py` 를 20s 주기로 구동.
   디렉토리 이동 시 plist 경로 재지정 필요.
 - **Anna's Archive:** `annas:` 접두어로만 opt-in(저작권=사용자 책임).
