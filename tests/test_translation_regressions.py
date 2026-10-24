@@ -99,6 +99,40 @@ class FinalQualityRegressions(unittest.TestCase):
         with self.assertRaises(QualityAuditError):
             audit_and_correct(subject, TRUTH, lambda _: reply)
 
+    def test_negated_formula_requires_full_source_span_before_exemption(self):
+        subject = book("οὔ τι προσέφη πολύμητις Ὀδυσσεύς", "오디세우스는 대답하지 않았다.")
+        sheet = {"concepts": [{"concept_id": "speech",
+                  "source_terms": ["προσέφη πολύμητις Ὀδυσσεύς"],
+                  "canonical_ko": "대답하여 말하였다", "strict": True}]}
+        prompts = []
+
+        def respond(messages):
+            prompts.append(messages)
+            expression = ("οὔ τι προσέφη" if len(prompts) == 1
+                          else subject.chapters[0].pairs[0][0])
+            return verdict(text=subject.chapters[0].pairs[0][1],
+                           source_sense_exemptions=[{
+                               "concept_id": "speech", "source_expression": expression,
+                               "reason": "The formula is negated; affirmative speech would reverse its meaning."}])
+
+        report = audit_and_correct(subject, sheet, respond)
+        self.assertEqual(2, len(prompts))
+        self.assertIn("ENTIRE matched source_terms", prompts[1][1]["content"])
+        self.assertEqual(1, report["source_sense_exemptions"])
+        self.assertEqual("오디세우스는 대답하지 않았다.", subject.chapters[0].pairs[0][1])
+
+    def test_negated_formula_exemption_cannot_cover_another_affirmative_occurrence(self):
+        formula = "προσέφη πολύμητις Ὀδυσσεύς"
+        negation = "οὔ τι " + formula
+        subject = book(negation + "; " + formula, "오디세우스는 아무 말도 하지 않았다.")
+        sheet = {"concepts": [{"concept_id": "speech", "source_terms": [formula],
+                              "canonical_ko": "대답하여 말하였다", "strict": True}]}
+        response = verdict(text=subject.chapters[0].pairs[0][1], source_sense_exemptions=[{
+            "concept_id": "speech", "source_expression": negation,
+            "reason": "The first occurrence is negated."}])
+        with self.assertRaises(QualityAuditError):
+            audit_and_correct(subject, sheet, lambda _: response)
+
     def test_terms_are_matched_in_visible_text_not_html_attributes(self):
         subject = book('Die <em class="concept">Wahrheit</em> bleibt.', '진<strong>리</strong>는 남는다.')
         self.assertEqual([], find_violations(subject, TRUTH))

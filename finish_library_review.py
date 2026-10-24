@@ -214,7 +214,47 @@ def refine(path: Path, entry, content):
                    if not trees[name].xpath('//*[contains(concat(" ",normalize-space(@class)," ")," bf-original ")]')
                    and plain_text(etree.tostring(trees[name], encoding="unicode"))]
         if not notices:
-            raise ValueError("editorial note requested without an edition notice page")
+            # Fresh assemblies need not contain an inherited edition notice.
+            # Add front matter without touching any approved bilingual unit.
+            index = 1
+            existing_ids = set(opf.xpath('//@id'))
+            if ncx_name:
+                existing_ids.update(trees[ncx_name].xpath('//@id'))
+            while (f"review-notice-{index}" in existing_ids or
+                   posixpath.join(posixpath.dirname(opfn), f"review-notice-{index}.xhtml") in files):
+                index += 1
+            identifier = f"review-notice-{index}"
+            name = posixpath.join(posixpath.dirname(opfn), identifier + ".xhtml")
+            tree = etree.Element(f"{{{XHTML_NS}}}html", nsmap={None: XHTML_NS}, lang="ko")
+            tree.set(f"{{{XML_NS}}}lang", "ko")
+            head = etree.SubElement(tree, f"{{{XHTML_NS}}}head")
+            etree.SubElement(head, f"{{{XHTML_NS}}}title").text = "교정판 안내"
+            body = etree.SubElement(tree, f"{{{XHTML_NS}}}body")
+            etree.SubElement(body, f"{{{XHTML_NS}}}h1").text = "교정판 안내"
+            trees[name] = tree
+            etree.SubElement(opf.find("o:manifest", NS), f"{{{NS['o']}}}item",
+                             id=identifier, href=identifier + ".xhtml",
+                             attrib={"media-type": "application/xhtml+xml"})
+            opf.find("o:spine", NS).insert(0, etree.Element(f"{{{NS['o']}}}itemref", idref=identifier))
+            toc = trees[nav_name].xpath(
+                '//*[local-name()="nav"][@*[local-name()="type"]="toc"]/*[local-name()="ol"]')[0]
+            li = etree.Element(f"{{{XHTML_NS}}}li")
+            link = etree.SubElement(li, f"{{{XHTML_NS}}}a", lang="ko",
+                                    href=posixpath.relpath(name, posixpath.dirname(nav_name)))
+            link.set(f"{{{XML_NS}}}lang", "ko")
+            link.text = "교정판 안내"
+            toc.insert(0, li)
+            if ncx_name:
+                navmap = trees[ncx_name].find("n:navMap", NS)
+                point = etree.Element(f"{{{NS['n']}}}navPoint", id=identifier)
+                label = etree.SubElement(point, f"{{{NS['n']}}}navLabel")
+                etree.SubElement(label, f"{{{NS['n']}}}text").text = "교정판 안내"
+                etree.SubElement(point, f"{{{NS['n']}}}content",
+                                 src=posixpath.relpath(name, posixpath.dirname(ncx_name)))
+                navmap.insert(0, point)
+                for order, item in enumerate(navmap.iter(f"{{{NS['n']}}}navPoint"), 1):
+                    item.set("playOrder", str(order))
+            notices = [body]
         body = notices[0]
         note = body.find('x:p[@id="review-editorial-note"]', NS)
         if note is None:

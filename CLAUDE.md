@@ -123,6 +123,9 @@ explicit-device tools may still reference `crosspoint-agentdeck`; generation doe
   also require occurrence-specific exceptions: repeated collisions need separate
   `ko_start` offsets in plain Korean or one-based `ko_occurrence` indices, so a legitimate ethnonym cannot exempt an
   unrelated mistranslated name elsewhere in the same paragraph.
+  A negated speech formula must not be forced into an affirmative canonical phrase;
+  its reviewed exception must quote the entire matched formula plus the negation,
+  rather than a shorter verb fragment. Other occurrences still require review.
 - **Publication:** validate before atomic output replacement and before publication.
   Compare every original/Korean visible-text pair in EPUB spine order with the
   approved book, not merely the number of pairs. This is separate from semantic
@@ -134,6 +137,9 @@ explicit-device tools may still reference `crosspoint-agentdeck`; generation doe
   Changed hashes, symlinks, shared other-edition paths and paths outside the managed
   library block cleanup. Do not retain old EPUB backups. Source text and editorial
   audit records remain distinct from obsolete deliverable files.
+  Reviewed EPUBs without an inherited notice receive a Korean editorial front-matter
+  page with a collision-free ID and TOC/NCX links. Repeated finalization reuses that
+  page and preserves every approved bilingual pair.
 - **Concurrency:** use catalog/queue transaction helpers; `os.replace()` alone is
   not a read-modify-write lock. Hold `catalog.request_worker(req_id)` for the run.
   MCP startup, status lookup and recent-request listing recover orphaned worker

@@ -112,6 +112,55 @@ License text.
                 translated = original.getnext()
                 self.assertEqual(pairs[1][1], "".join(translated.itertext()))
 
+    def test_editorial_notice_is_added_once_without_changing_approved_pairs(self):
+        import zipfile
+        from lxml import etree
+        from finish_library_review import refine
+        pairs = [("An original sentence.", "원문 문장이다.")]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(assemble.assemble({"title": "Test", "chapters": [
+                {"title": "I", "pairs": pairs}]}, str(Path(directory) / "book.epub")))
+            # A valid EPUB can list landmarks before the TOC and reserve the
+            # proposed notice ID on metadata rather than a manifest resource.
+            with zipfile.ZipFile(path) as archive:
+                members = [(info, archive.read(info)) for info in archive.infolist()]
+            edited = {}
+            xhtml = "http://www.w3.org/1999/xhtml"
+            epub = "http://www.idpf.org/2007/ops"
+            xml = "http://www.w3.org/XML/1998/namespace"
+            nav = etree.fromstring(dict((i.filename, data) for i, data in members)["OEBPS/nav.xhtml"])
+            landmarks = etree.Element(f"{{{xhtml}}}nav", attrib={f"{{{epub}}}type": "landmarks"})
+            listing = etree.SubElement(landmarks, f"{{{xhtml}}}ol")
+            li = etree.SubElement(listing, f"{{{xhtml}}}li")
+            etree.SubElement(li, f"{{{xhtml}}}a", href="chapter1.xhtml",
+                             attrib={f"{{{epub}}}type": "bodymatter"}).text = "Body"
+            nav.find(f"{{{xhtml}}}body").insert(0, landmarks)
+            edited["OEBPS/nav.xhtml"] = etree.tostring(nav)
+            opf_name = next(info.filename for info, _ in members if info.filename.endswith(".opf"))
+            opf = etree.fromstring(dict((i.filename, data) for i, data in members)[opf_name])
+            opf.xpath('//*[local-name()="title"]')[0].set("id", "review-notice-1")
+            edited[opf_name] = etree.tostring(opf)
+            with zipfile.ZipFile(path, "w") as archive:
+                for info, data in members:
+                    archive.writestr(info, edited.get(info.filename, data))
+            entry = {"source_format": "epub", "editorial_note": "새 교정본 안내"}
+            for _ in range(2):
+                _, report = refine(path, entry, pairs)
+                self.assertTrue(report["content_compared"])
+            with zipfile.ZipFile(path) as archive:
+                notices = [n for n in archive.namelist() if "review-notice-" in n]
+                self.assertEqual(1, len(notices))
+                self.assertTrue(notices[0].endswith("review-notice-2.xhtml"))
+                notice = etree.fromstring(archive.read(notices[0]))
+                self.assertEqual("새 교정본 안내", notice.xpath('//*[@id="review-editorial-note"]')[0].text)
+                nav = etree.fromstring(archive.read("OEBPS/nav.xhtml"))
+                links = nav.xpath('//*[local-name()="a" and contains(@href,"review-notice-")]')
+                self.assertEqual(1, len(links))
+                self.assertEqual("toc", links[0].getparent().getparent().getparent().get(f"{{{epub}}}type"))
+                self.assertEqual("ko", links[0].get("lang"))
+                self.assertEqual("ko", links[0].get(f"{{{xml}}}lang"))
+            self.assertEqual(pairs, [p for c in read_bilingual(path).chapters for p in c.pairs])
+
     def test_pipeline_debris_cannot_be_kept_or_inherited_from_old_approval(self):
         from quality_audit import QualityAuditError, audit_translation_quality, find_translation_integrity_violations
         for token in ("⟦P⟔", "⟦P⟧", "◀Q0TAG1▶"):
