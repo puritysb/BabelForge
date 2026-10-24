@@ -6,6 +6,8 @@ import hashlib
 import re
 import sys
 import unicodedata
+from model_json import (ModelResponseError, parse_model_object,
+                        json_object_or_none as _json_object)
 
 import config
 
@@ -18,7 +20,7 @@ class QualityAuditError(RuntimeError):
 
 
 _HANGUL_PATTERN = re.compile(r"[가-힣]")
-SEMANTIC_AUDIT_VERSION = "semantic-v5-independent-approval"
+SEMANTIC_AUDIT_VERSION = "semantic-v6-strict-json"
 
 # Shared by drafting, proofreading and final review: these are checks, never
 # mechanical substitutions for a particular book or language.
@@ -55,34 +57,6 @@ def _stash_tags(text: str, prefix: str) -> tuple[str, dict[str, str]]:
 
 def _restore_tags(text: str, mapping: dict[str, str]) -> str:
     return restore_inline_tags(text, mapping)
-
-
-def _json_object(raw: str) -> dict | None:
-    if not isinstance(raw, str):
-        return None
-    raw = raw.strip()
-    raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*```$", "", raw)
-    try:
-        obj = json.loads(raw)
-        return obj if isinstance(obj, dict) else None
-    except json.JSONDecodeError:
-        start, end = raw.find("{"), raw.rfind("}")
-        if 0 <= start < end:
-            try:
-                obj = json.loads(raw[start:end + 1])
-                return obj if isinstance(obj, dict) else None
-            except json.JSONDecodeError:
-                # Recover a complete object followed only by duplicate closers.
-                # Never invent missing text or discard a second JSON object.
-                try:
-                    obj, consumed = json.JSONDecoder().raw_decode(raw[start:end + 1])
-                    trailing = raw[start:end + 1][consumed:]
-                    if isinstance(obj, dict) and re.fullmatch(r"[}\]\s]*", trailing):
-                        return obj
-                except json.JSONDecodeError:
-                    pass
-    return None
 
 
 def _source_matches(text: str, form: str) -> list[tuple[int, int]]:
@@ -311,9 +285,14 @@ def audit_translation_quality(book, chat_fn, chunk_size: int = 12,
                 user = {"paragraphs": payload}
                 if feedback:
                     user["validation_feedback"] = feedback
-                parsed = _json_object(chat_fn([
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": json.dumps(user, ensure_ascii=False)}]))
+                try:
+                    parsed = parse_model_object(chat_fn([
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": json.dumps(user, ensure_ascii=False)}]))
+                except ModelResponseError as exc:
+                    feedback = ("Unusable response: " + str(exc) +
+                                ". Return exactly one complete JSON object with the required paragraphs array.")
+                    continue
                 reviews = parsed.get("paragraphs") if parsed else None
                 if not isinstance(reviews, list):
                     feedback = "Return the required paragraphs array as valid JSON."
@@ -341,6 +320,13 @@ def audit_translation_quality(book, chat_fn, chunk_size: int = 12,
                     quote = item.get("source_quote", "")
                     category = item.get("category", "meaning")
                     if action == "keep":
+                        supplied = item.get("corrected_ko")
+                        if supplied not in (None, "") and (
+                                not isinstance(supplied, str)
+                                or not placeholders_preserved(supplied, maps[key])
+                                or _restore_tags(supplied.strip(), maps[key]) != row["current_ko"]):
+                            errors.append(f"{key}: keep contradicts corrected_ko; return one unambiguous verdict")
+                            continue
                         text = row["current_ko"]
                     elif action == "correct":
                         stashed = item.get("corrected_ko")
@@ -654,15 +640,15 @@ def audit_and_correct(book, concept_sheet: dict, chat_fn,
             attempt_prompt = dict(prompt)
             if feedback:
                 attempt_prompt["validation_feedback"] = feedback
-            raw = chat_fn([
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(
-                    attempt_prompt, ensure_ascii=False)},
-            ])
-            parsed = _json_object(raw)
-            if parsed is None:
+            try:
+                parsed = parse_model_object(chat_fn([
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": json.dumps(
+                        attempt_prompt, ensure_ascii=False)},
+                ]))
+            except ModelResponseError as exc:
                 feedback = (
-                    "The previous response was not valid JSON. Return the exact "
+                    f"The previous response was unusable ({exc}). Return the exact "
                     "requested schema and every paragraph."
                 )
                 continue
