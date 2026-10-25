@@ -269,6 +269,49 @@ checkout or replacing the JDK, regenerate a valid report for that checkout and
 rerun the installer to update paths. Settings/installation receipts and reports are
 local ignored data; source code, procedure and offline regression tests stay in Git.
 
+## Controlled LINE notification drill
+
+Use the repository tool rather than a copied script or edits to production settings:
+
+```bash
+# Preview only: no Gateway/checker calls, writes or messages.
+./venv/bin/python3 openclaw_line_drill.py --job-id EXISTING_MONITOR_ID
+# Only when the user explicitly authorizes a live LINE test:
+./venv/bin/python3 openclaw_line_drill.py --job-id EXISTING_MONITOR_ID --send-test-alert
+# --config may select the existing installed monitor settings.
+```
+
+The live invocation uses the already approved recipient; it never accepts a new
+destination. It requires exactly one enabled repository declaration with the same
+command/config, explicit Java/PATH, scheduler timeouts, disabled native delivery and
+failure alerts, and exact 09:00 Asia/Seoul schedule. An active monitor or insufficient
+time before the next scheduled run blocks the drill before any message. The tool
+holds the production monitor lock while testing, without changing the scheduled job.
+
+Every invocation creates a fresh private directory under ignored
+`data/openclaw-monitor/drills/`. A synthetic checker failure runs through the real
+monitor and notifier with an explicit Korean test label explaining that production
+is unaffected. Require a confirmed LINE receipt for the first anomaly, `suppressed`
+for the identical anomaly, and `not-requested`/`NO_REPLY` after a real full check-only
+recovery against the unchanged approved baseline. The transport caps **attempts** at
+one, including unknown or timed-out sends. An unknown receipt fails the drill; never
+automatically replay it or schedule repeated drills. Inspect its retained evidence
+before considering a new explicitly authorized test. A failed recovery is recorded
+locally without sending another message.
+
+The `finally` cleanup preserves isolated incident/receipt evidence, then clears only
+that isolated incident. It compares hashes/modes of production settings, installation
+receipt, manifest and runtime files and rechecks the unique job's full retained
+command/schedule/notification policy. Missing or changed state, incomplete EPUB or
+approval results, cleanup failure, and an unavailable Gateway all prevent success.
+It never restores old bytes over external changes or edits a drifting schedule;
+resolve the reported condition separately. `result.json` records completion and each
+phase, and the CLI exits nonzero on failure. If interrupted, the unique workspace
+remains forensic evidence and is never resumed; production incident state stays
+separate. This is an on-demand operator drill, not part of normal daily monitoring.
+Automated regression tests use temporary state and mock all external calls, so they
+cannot send LINE or touch production books.
+
 ## Optional legacy device delivery
 
 Direct device push is off by default. Only use `BABELFORGE_DEVICE_PUSH=1` when the user

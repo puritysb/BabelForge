@@ -165,7 +165,7 @@ def receipt(value):
     return isinstance(value, list) and any(receipt(v) for v in value)
 
 
-def notify(settings, error, stage, report_path, log_path, state_path):
+def notify(settings, error, stage, report_path, log_path, state_path, *, drill=False, transport=None):
     fingerprint = incident(error, stage, settings['expected'])
     try:
         previous = json.loads(state_path.read_text())
@@ -182,13 +182,16 @@ def notify(settings, error, stage, report_path, log_path, state_path):
     message = (f'BabelForge 점검 이상 {now}\n영향: {names}\n단계: {phase}\n'
                f'원인: {reason(error)[1]}\n보고서: {report_path}\n로그: {log_path}\n'
                '조치: 로컬 기록을 확인해 원인 수정 후 재점검. 자동 수리는 하지 않음.')
+    if drill:
+        message = ('[통제된 LINE 알림 시험 · 운영 이상 아님]\n'
+                   '별도 시험 상태의 가상 이상입니다. 아래 목록은 시험 대상이며 운영 영향은 없습니다.\n' + message)
     # Persist before sending. A crash or ambiguous CLI result cannot cause a duplicate push.
     state = {'fingerprint': fingerprint, 'delivery': 'pending', 'report': str(report_path), 'time': now}
     save(state_path, state)
     try:
         env = os.environ.copy()
         env['PATH'] = settings.get('execution_path', env.get('PATH', os.defpath))
-        result = subprocess.run([settings['openclaw'], 'message', 'send', '--channel', 'line',
+        result = (transport or subprocess.run)([settings['openclaw'], 'message', 'send', '--channel', 'line',
                                  '--target', settings['line_target'], '--message', message, '--json'],
                                 capture_output=True, text=True, timeout=45, env=env)
         confirmed = result.returncode == 0 and receipt(json.loads(result.stdout))
@@ -199,10 +202,13 @@ def notify(settings, error, stage, report_path, log_path, state_path):
     return state['delivery']
 
 
-def run(settings):
+def run(settings, *, checker=None, notifier=None, report_dir=None):
+    # In-process drill hooks; scheduled CLI/config cannot select alternate implementations.
+    checker = checker or check_command
+    notifier = notifier or notify
     runtime = Path(settings['runtime_dir']); runtime.mkdir(parents=True, exist_ok=True)
     run_id = uuid.uuid4().hex
-    report_path = Path(config.DATA_DIR)/'deployments'/f'openclaw-{run_id}.json'
+    report_path = Path(report_dir or Path(config.DATA_DIR)/'deployments')/f'openclaw-{run_id}.json'
     log_path = runtime/f'{run_id}.log'
     state_path = runtime/'incident.json'
     with file_lock(str(runtime/'monitor.lock'), blocking=False):
@@ -210,7 +216,7 @@ def run(settings):
         report = {}
         error = None
         try:
-            result = check_command(settings, report_path, log_path)
+            result = checker(settings, report_path, log_path)
             if report_path.exists(): report = json.loads(report_path.read_text())
             require(result == 0, report.get('error') or 'Verification command failed')
             require(report.get('mode') == 'check', 'Monitor must use check-only')
@@ -221,7 +227,7 @@ def run(settings):
         except Exception as exc:
             error = f'{type(exc).__name__}: {exc}'
             record['error'] = error  # local record only
-            record['notification'] = notify(settings, error, report.get('stage', 'monitor'),
+            record['notification'] = notifier(settings, error, report.get('stage', 'monitor'),
                                              report_path, log_path, state_path)
         save(runtime/f'{run_id}.json', record)
         save(runtime/'latest.json', record)
