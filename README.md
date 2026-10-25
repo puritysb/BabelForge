@@ -58,6 +58,11 @@ MCP에서는 `search_books`, `translate_book`, `retry_request`, `get_status`, `l
 OPDS 최신본과 구판·중복 여부를 자동 검사하고, 실패 시 단계별 보고서를 남깁니다.
 재시작 없는 점검도 지원하며, 명령과 매니페스트 요건은 위 스킬을 참조하십시오.
 
+OpenClaw 정기 점검은 저장소의 `openclaw_monitor.py`를 실행합니다.
+`install_openclaw_monitor.py`가 검증된 Java 환경과 로컬 승인 기준을 설정하고 기존 예약을
+갱신합니다. 정상·복구 시에는 알리지 않고 이상만 승인된 LINE 대상으로 통지합니다.
+재설치와 기준 갱신 절차도 위 스킬에서 관리합니다.
+
 공개 OPDS 주소: **https://books.foundby.kr/opds**. 기기로 직접 보내는 기능은 기본적으로
 꺼져 있으며, 기존 장치 연동이 필요한 경우에만 `BABELFORGE_DEVICE_PUSH=1`로 켭니다.
 기기 전송이나 알림 실패는 EPUB 생성·배포 완료를 취소하지 않습니다.

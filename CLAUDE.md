@@ -48,6 +48,8 @@ instead of silently resetting the catalog or queue.
 | `publication.py` | Serialized revision promotion, temporary staging, public OPDS acquisition/content/EPUBCheck verification, catalog commit and identity/hash-bound obsolete deletion. No old-edition backups. |
 | `publish_reviewed.py` | Publishes a completed review manifest only after exact final approval and artifact checks; supports a read-only preflight. |
 | `deploy_mcp.py` | Managed MCP deployment gate: current approvals, local/public EPUBCheck, complete catalog/Calibre/OPDS inventory, exact approved contents, delivery bundles, and obsolete/duplicate detection. Durable failure/success reports under `data/deployments/`. |
+| `openclaw_monitor.py`, `install_openclaw_monitor.py` | Repository-owned anomaly-only LINE monitor and idempotent OpenClaw job installer. Local inventory/recipient configuration and incident history stay under ignored `data/openclaw-monitor/`. |
+| `java_runtime.py` | Probes a runnable Java 17+ and constructs an explicit environment; avoids obsolete macOS Java launchers and shell activation dependence. |
 | `state_store.py`, `catalog.py` | POSIX process locks, atomic state transactions, conditional retry claims and crashed-worker recovery. |
 | `babelforge_mcp.py` | Typed search, detached translation, retry and status tools. Local streamable HTTP on `127.0.0.1:8770/mcp` by default. |
 | `device_push.py`, `pending_queue.py`, `auto_push_watcher.py` | Optional legacy device integration. Disabled by default. |
@@ -217,6 +219,17 @@ inventory can produce a completed deployment report. A failed post-restart check
 leaves the service running but records failure; it never approves, republishes,
 deletes books, rolls back artifacts, or weakens server write policy. Check-only mode
 does not restart the service and records the checkout fingerprint, including edits.
+
+OpenClaw monitoring uses the repository entry point, not a copied workspace script.
+Its installer pins expected editions to a successful verification report and reuses
+the stable job declaration/ID. Native delivery/failure alerts are disabled because
+the monitor alone sends approved LINE anomaly messages. Success/recovery is silent;
+same incidents are suppressed until recovery, while uncertain send receipts remain
+unknown and are never blindly replayed. Only predefined diagnostic categories and
+local report/log paths leave the host; book text and raw errors stay local. The
+checker has a shorter timeout than its scheduler and kills its Java process group
+on expiry. Reinstallation preserves incident state; rebasing expectations requires
+an explicitly supplied new successful report. See the skill for setup commands.
 
 Invoke `venv/bin/python3` directly. This venv was moved historically, so activation
 scripts/console-script shebangs may have stale paths; recreate from requirements

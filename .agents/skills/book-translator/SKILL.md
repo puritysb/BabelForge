@@ -204,6 +204,71 @@ successful deployment. Failed post-restart validation leaves the service running
 and the library intact for diagnosis; fix the cause, then rerun with a fresh report.
 Check-only mode may inspect an uncommitted checkout but never claims to deploy it.
 
+## Install or reinstall OpenClaw monitoring
+
+The canonical monitor is `openclaw_monitor.py` in this repository. Do not copy its
+implementation into the OpenClaw workspace. First obtain a successful complete
+`deploy_mcp.py --check-only` report, then prepare a local configuration:
+
+```bash
+./venv/bin/python3 install_openclaw_monitor.py manifest.json \
+  --baseline-report data/deployments/successful-check.json \
+  --line-target APPROVED_PERSONAL_LINE_ID
+# Review the plan, then repeat with --apply to write settings and reconcile the job.
+# On migration, --job-id EXISTING_MONITOR_ID asserts the intended job identity.
+```
+
+The LINE destination must already be explicitly approved by the user. No normal,
+setup-completion or recovery messages are sent. The installer defaults to a preview,
+requires a complete baseline report tied to the unchanged manifest, actually probes
+a compatible Java 17+, and rejects an invalid explicit `--java-home`. Discovery can
+skip a broken inherited Java environment; use `--java-home /path/to/jdk` to pin a
+known compatible runtime. `--openclaw /path/to/openclaw` overrides CLI discovery.
+No API keys or personal destination IDs belong in tracked files.
+
+`--apply` writes private mode-0600 settings under `data/openclaw-monitor/` and
+creates or updates one OpenClaw command job at 09:00 Asia/Seoul. Its stable
+declaration is `babelforge-mcp-opds-daily-v1`. Existing IDs are reused by stable declaration; a matching name alone never
+authorizes adoption. Legacy jobs without a declaration require explicit --job-id.
+Ambiguous or unrelated jobs and active runs block installation. New jobs are created disabled
+until the explicit no-delivery/no-native-failure-alert policy is applied. The job
+runs the repository venv and monitor directly, with an explicit Java environment
+and the installer-resolved OpenClaw/Node/Bun search path. Manual monitor invocations
+use that same saved search path for notifications.
+Scheduler/no-output limits are 300 seconds longer than the checker's timeout,
+leaving time to terminate Java descendants, record the failure and send an alert.
+Reinstalling leaves incident state and history intact.
+
+```bash
+./venv/bin/python3 openclaw_monitor.py
+# Or select local settings with --config /path/to/config.json.
+# Use the returned job ID for a real scheduler test:
+openclaw cron run JOB_ID --wait --wait-timeout 25m
+openclaw cron runs JOB_ID --limit 1 --json
+```
+
+A healthy run prints `NO_REPLY`, records its fresh report/log and clears the prior
+incident silently. A first anomaly sends only predefined diagnostic facts,
+affected edition identifiers and local report/log paths to the approved LINE
+recipient. Book text, raw errors and credentials stay local. Repeated identical
+failures are suppressed; a changed cause or recurrence after a healthy check is
+new. Corrupt incident JSON does not suppress the first alert. A pending/ambiguous
+send is recorded as unknown and is not automatically replayed, to avoid duplicate
+pushes. Inspect `data/openclaw-monitor/runtime/incident.json` and delivery history
+before deliberately clearing such a state. Overlapping monitor invocations exit
+75 without launching another checker or notifier.
+
+The wrapper does not restart services, reapprove/retranslate/republish or delete
+books. Native OpenClaw delivery/failure alerts must stay disabled because this
+wrapper owns anomaly delivery. Failure returns nonzero; healthy completion requires
+all local/public standard and content checks, matching current approvals, inventory
+and the installation baseline. Following a new approved revision or review-version
+change, explicitly supply a new successful report and reinstall; never automatically
+accept a changed manifest or hashes merely to silence an alert. After moving the
+checkout or replacing the JDK, regenerate a valid report for that checkout and
+rerun the installer to update paths. Settings/installation receipts and reports are
+local ignored data; source code, procedure and offline regression tests stay in Git.
+
 ## Optional legacy device delivery
 
 Direct device push is off by default. Only use `BABELFORGE_DEVICE_PUSH=1` when the user
