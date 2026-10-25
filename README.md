@@ -62,6 +62,8 @@ OpenClaw 정기 점검은 저장소의 `openclaw_monitor.py`를 실행합니다.
 `install_openclaw_monitor.py`가 검증된 Java 환경과 로컬 승인 기준을 설정하고 기존 예약을
 갱신합니다. 정상·복구 시에는 알리지 않고 이상만 승인된 LINE 대상으로 통지합니다.
 재설치와 기준 갱신 절차도 위 스킬에서 관리합니다.
+`openclaw_line_drill.py`는 운영 상태와 분리된 LINE 알림 시험을 제공합니다. 기본은 미리보기이며,
+명시적 시험 실행에서 최초 1회 전송·중복 억제·무알림 복구와 기존 일정 유지를 검증합니다.
 
 공개 OPDS 주소: **https://books.foundby.kr/opds**. 기기로 직접 보내는 기능은 기본적으로
 꺼져 있으며, 기존 장치 연동이 필요한 경우에만 `BABELFORGE_DEVICE_PUSH=1`로 켭니다.

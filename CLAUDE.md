@@ -49,6 +49,7 @@ instead of silently resetting the catalog or queue.
 | `publish_reviewed.py` | Publishes a completed review manifest only after exact final approval and artifact checks; supports a read-only preflight. |
 | `deploy_mcp.py` | Managed MCP deployment gate: current approvals, local/public EPUBCheck, complete catalog/Calibre/OPDS inventory, exact approved contents, delivery bundles, and obsolete/duplicate detection. Durable failure/success reports under `data/deployments/`. |
 | `openclaw_monitor.py`, `install_openclaw_monitor.py` | Repository-owned anomaly-only LINE monitor and idempotent OpenClaw job installer. Local inventory/recipient configuration and incident history stay under ignored `data/openclaw-monitor/`. |
+| `openclaw_line_drill.py` | Explicit one-message LINE drill with isolated state, duplicate/recovery checks, production fingerprints and unchanged daily-job verification. Preview by default. |
 | `java_runtime.py` | Probes a runnable Java 17+ and constructs an explicit environment; avoids obsolete macOS Java launchers and shell activation dependence. |
 | `state_store.py`, `catalog.py` | POSIX process locks, atomic state transactions, conditional retry claims and crashed-worker recovery. |
 | `babelforge_mcp.py` | Typed search, detached translation, retry and status tools. Local streamable HTTP on `127.0.0.1:8770/mcp` by default. |
@@ -230,6 +231,16 @@ local report/log paths leave the host; book text and raw errors stay local. The
 checker has a shorter timeout than its scheduler and kills its Java process group
 on expiry. Reinstallation preserves incident state; rebasing expectations requires
 an explicitly supplied new successful report. See the skill for setup commands.
+
+The LINE drill uses the same monitor/notification implementation through in-process
+checker/transport hooks; scheduled settings cannot enable these hooks. It never edits
+the scheduled job or production incident state. An explicit live flag permits at most
+one clearly labelled real message; duplicate and recovery phases cannot send again.
+Recovery uses the real check-only validator. A production monitor lock prevents
+overlap, and a reservation check refuses a drill near the next scheduled run.
+Finally it disarms only its isolated incident, preserves receipt evidence, and verifies
+production fingerprints plus the single enabled 09:00 Asia/Seoul job. Drift is reported
+as failure rather than overwritten. Offline regression tests mock every external call.
 
 Invoke `venv/bin/python3` directly. This venv was moved historically, so activation
 scripts/console-script shebangs may have stale paths; recreate from requirements
