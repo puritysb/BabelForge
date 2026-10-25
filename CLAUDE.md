@@ -50,6 +50,7 @@ instead of silently resetting the catalog or queue.
 | `deploy_mcp.py` | Managed MCP deployment gate: current approvals, local/public EPUBCheck, complete catalog/Calibre/OPDS inventory, exact approved contents, delivery bundles, and obsolete/duplicate detection. Durable failure/success reports under `data/deployments/`. |
 | `openclaw_monitor.py`, `install_openclaw_monitor.py` | Repository-owned anomaly-only LINE monitor and idempotent OpenClaw job installer. Local inventory/recipient configuration and incident history stay under ignored `data/openclaw-monitor/`. |
 | `openclaw_line_drill.py` | Explicit one-message LINE drill with isolated state, duplicate/recovery checks, production fingerprints and unchanged daily-job verification. Preview by default. |
+| `openclaw_followup.py`, `install_openclaw_followup.py` | One-shot scheduled-run follow-up: complete scheduler receipts, unique per-run ledger/report linkage, pinned approvals/inventory and job policy, silent success, and receipt-aware anomaly deduplication. |
 | `java_runtime.py` | Probes a runnable Java 17+ and constructs an explicit environment; avoids obsolete macOS Java launchers and shell activation dependence. |
 | `state_store.py`, `catalog.py` | POSIX process locks, atomic state transactions, conditional retry claims and crashed-worker recovery. |
 | `babelforge_mcp.py` | Typed search, detached translation, retry and status tools. Local streamable HTTP on `127.0.0.1:8770/mcp` by default. |
@@ -241,6 +242,20 @@ overlap, and a reservation check refuses a drill near the next scheduled run.
 Finally it disarms only its isolated incident, preserves receipt evidence, and verifies
 production fingerprints plus the single enabled 09:00 Asia/Seoul job. Drift is reported
 as failure rather than overwritten. Offline regression tests mock every external call.
+
+Follow-ups use a repository command rather than an agent interpreting a copied prompt.
+The installer previews by default and freezes the approved monitor settings/recipient,
+manifest and daily job policy in private ignored state. It registers a disabled one-shot
+until no native delivery/failure alerts are applied, then enables it without editing the
+daily job. Explicit legacy IDs permit migration of the old dated prompt job. Existing
+plans/incident receipts are never silently reset. The follow-up never reruns a missed
+job or accepts a manual run, a stale report, latest.json alone, ambiguous time overlap,
+partial history, incomplete approvals or EPUBCheck as success. Per-run monitor ledgers
+include start/finish times and the exact incident fingerprint, even if the checker could
+not create a report. A proven matching daily send/unknown receipt suppresses only that
+same failure; a separate schedule/config anomaly must still be reported. Independent
+pre/post baseline and schedule audits cannot be skipped by a history failure. Alert
+attempts are durable before sending, use isolated state, and are never blindly replayed.
 
 Invoke `venv/bin/python3` directly. This venv was moved historically, so activation
 scripts/console-script shebangs may have stale paths; recreate from requirements

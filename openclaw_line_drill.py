@@ -17,9 +17,10 @@ import openclaw_monitor as monitor
 from state_store import file_lock
 
 
-def job_policy(settings, settings_path, job_id, *, reserve=False):
-    response = cli(settings['openclaw'], 'list', '--all', '--json')
-    jobs = response.get('jobs', []) if isinstance(response, dict) else response
+def job_policy(settings, settings_path, job_id, *, reserve=False, jobs=None):
+    if jobs is None:
+        response = cli(settings['openclaw'], 'list', '--all', '--json')
+        jobs = response.get('jobs', []) if isinstance(response, dict) else response
     matches = [j for j in jobs if j.get('declarationKey') == DECLARATION or j.get('name') == JOB_NAME]
     monitor.require(len(matches) == 1 and matches[0].get('id') == job_id,
                     'Missing, duplicate or unrelated monitor job')

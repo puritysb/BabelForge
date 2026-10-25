@@ -312,6 +312,69 @@ separate. This is an on-demand operator drill, not part of normal daily monitori
 Automated regression tests use temporary state and mock all external calls, so they
 cannot send LINE or touch production books.
 
+## One-shot follow-up of an actual scheduled run
+
+Use repository-owned code to verify a particular date's 09:00 Asia/Seoul daily run.
+The baseline may contain any number of approved editions; do not hardcode six books
+or today's paragraph count into a new installation.
+
+```bash
+# Read-only preview; inspects the existing daily job but never sends or schedules.
+./venv/bin/python3 install_openclaw_followup.py --job-id DAILY_JOB_ID --date YYYY-MM-DD
+# Register only when the user requests that follow-up; default delay is 30 minutes.
+./venv/bin/python3 install_openclaw_followup.py --job-id DAILY_JOB_ID --date YYYY-MM-DD --apply
+# Explicit migration of the previously installed dated agent-prompt job:
+./venv/bin/python3 install_openclaw_followup.py --job-id DAILY_JOB_ID --date YYYY-MM-DD \
+  --existing-job-id LEGACY_FOLLOWUP_ID --apply
+```
+
+The daily job must match the installed repository command, Java/PATH, timeout,
+stable declaration, exact 09:00 schedule and no native delivery/failure alerts.
+The date must be in the future. `--delay-minutes` must leave at least the checker
+timeout plus ten minutes for scheduler shutdown/start grace. The installer pins the
+private config, manifest and daily policy under ignored
+`data/openclaw-monitor/followups/`; its immutable settings snapshot preserves the
+already approved LINE route even if production config later drifts. No recipient or
+secret belongs in tracked source. Preview does not write a plan. Applying creates a
+disabled command job, explicitly disables native delivery/failure alerts, enables
+it, verifies the retained command/at-time/environment/timeouts and unchanged daily
+job, and saves a receipt. Ownership is deterministic by daily job ID/date. Duplicate,
+foreign or active jobs block installation. A legacy prompt declaration requires the
+explicit existing ID on migration/reinstallation; unrelated jobs are never adopted.
+Existing plans, results and uncertain send receipts are never rebased or erased.
+
+The one-shot runs `openclaw_followup.py --plan PLAN_PATH --execute` after the daily
+deadline, keeps its disabled job/history after completion, and never repeats daily.
+Calling without `--execute` previews the pinned plan without Gateway calls or writes.
+An early execution exits 75 without a missing-run alarm. Do not test a future plan
+by forcing its due time or manually rerunning the daily job.
+
+The evaluator reads all bounded/paginated scheduler history and requires exactly
+one finished scheduled run for the expected job within five minutes of the due
+time. Manual or duplicate/overlapping runs, missing/late completion and incomplete
+history cannot certify success. Only canonical UUID per-run monitor records and
+deployment reports count; `latest.json`, drill reports, symlinks and stale reports
+cannot substitute. Start/finish windows must uniquely join the scheduler receipt,
+ledger and report. Current review version, pinned manifest/config, exact approved
+inventory, every local/public/stable EPUBCheck/content comparison and MCP counts
+must validate. A healthy record requires `not-requested`, scheduler `NO_REPLY` and
+`deliveryStatus=not-requested`. Independent baseline/schedule checks run before and
+after evidence inspection, even if history lookup fails. The tool never changes
+books, approvals, production monitor state or daily schedule and never replaces a
+missed scheduled run with a manual one.
+
+Success writes a private local result and prints only `NO_REPLY`; no LINE success
+or recovery message is sent. A failed scheduled run whose exact ledger fingerprint
+matches a confirmed existing daily incident is `already-notified`. A matching
+pending/unknown receipt is not replayed. That suppression never hides an unrelated
+schedule/config error. Other anomalies send fixed diagnostic facts, affected IDs
+and local result paths through the existing notifier using isolated follow-up
+incident state. A private durable attempt record caps the follow-up at one send
+attempt, even after interruption, changed errors or an uncertain receipt. Retries
+must not delete this record. Failures exit nonzero; native alerts remain off to
+avoid duplicate pushes. Preserve the result/receipt and resolve the recorded cause
+separately. Offline regressions mock Gateway, LINE and all deployment effects.
+
 ## Optional legacy device delivery
 
 Direct device push is off by default. Only use `BABELFORGE_DEVICE_PUSH=1` when the user

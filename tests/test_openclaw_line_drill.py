@@ -110,7 +110,7 @@ class DrillTests(unittest.TestCase):
             self.assertTrue(result['summary']['isolated_incident_cleared'])
 
     def test_broken_deduplication_cannot_send_a_second_live_message(self):
-        with self.fixture() as f, patch.object(monitor, 'incident', side_effect=['first', 'changed']):
+        with self.fixture() as f, patch.object(monitor, 'incident', side_effect=['first', 'first', 'changed', 'changed']):
             result = self.execute(f)
             self.assertFalse(result['completed']); f['send'].assert_called_once()
             f['recovery'].assert_not_called()
