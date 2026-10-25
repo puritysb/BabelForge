@@ -55,11 +55,11 @@ def fetch(url):
         return response.read()
 
 
-def verify_public(book_id, expected, directory):
-    """Follow advertised links with pagination; require this ID exactly once."""
+def opds_acquisitions():
+    """Read Calibre's advertised newest view, preserving duplicate entries."""
     origin = config.OPDS_BASE_URL.rstrip("/")
     feed_url = config.OPDS_FEED_URL
-    queue, visited, found = [feed_url], set(), []
+    queue, visited, found = [feed_url], set(), {}
     while queue:
         url = queue.pop(0)
         if url in visited:
@@ -78,10 +78,17 @@ def verify_public(book_id, expected, directory):
                 href = link.get('href', '')
                 if 'acquisition' in link.get('rel', '') and link.get('type') == 'application/epub+zip':
                     parts = urlsplit(href).path.strip('/').split('/')
-                    if len(parts) >= 3 and parts[0] == 'get' and parts[1].lower() == 'epub' and parts[2] == str(book_id):
-                        found.append(_same_origin(url, href, origin))
+                    if len(parts) < 3 or parts[0] != 'get' or parts[1].lower() != 'epub' or not parts[2].isdigit():
+                        raise PublicationError("Unrecognized OPDS EPUB acquisition")
+                    found.setdefault(int(parts[2]), []).append(_same_origin(url, href, origin))
                 elif '4f6e6577657374' in href:  # Calibre's advertised By Newest view
                     queue.append(_same_origin(url, href, origin))
+    return found
+
+
+def verify_public(book_id, expected, directory):
+    """Follow advertised links with pagination; require this ID exactly once."""
+    found = opds_acquisitions().get(book_id, [])
     if len(found) != 1:
         raise PublicationError(f"OPDS must advertise record {book_id} exactly once, got {len(found)}")
     path = Path(directory) / 'acquisition.epub'
@@ -92,8 +99,11 @@ def verify_public(book_id, expected, directory):
     stable = Path(directory) / 'stable.epub'
     stable.write_bytes(fetch(publish.opds_url_for(book_id)))
     # Calibre may rewrite metadata, so compare visible content rather than ZIP bytes.
-    validate_epub(str(stable), external=False, expected_content=expected, expected_pairs=len(expected))
-    return {"acquisition_url": found[0], "sha256": digest(path), "validation": report}
+    stable_report = validate_epub(str(stable), expected_content=expected, expected_pairs=len(expected))
+    if stable_report['epubcheck'] != 'passed':
+        raise PublicationError("Official EPUBCheck is required for stable acquisitions")
+    return {"acquisition_url": found[0], "sha256": digest(path), "validation": report,
+            "stable_validation": stable_report}
 
 
 def _same_origin(base, href, origin):

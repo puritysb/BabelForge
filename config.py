@@ -46,6 +46,8 @@ VENV_PYTHON = os.path.join(BASE_DIR, "venv", "bin", "python3")
 # appliance by URL instead of shelling out to scripts. Local-only bind.
 MCP_HOST = os.environ.get("BABELFORGE_MCP_HOST", "127.0.0.1")
 MCP_PORT = int(os.environ.get("BABELFORGE_MCP_PORT", "8770"))
+MCP_LAUNCH_AGENT = os.path.expanduser(os.environ.get(
+    "BABELFORGE_MCP_LAUNCH_AGENT", "~/Library/LaunchAgents/com.local.babelforge-mcp.plist"))
 
 # ─── Calibre Content Server (OPDS delivery) ───
 CALIBRE_LIBRARY = os.path.expanduser("~/Calibre-Library")

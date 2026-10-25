@@ -54,6 +54,10 @@ MCP에서는 `search_books`, `translate_book`, `retry_request`, `get_status`, `l
 사용합니다. `translate_book(candidate, publish_output=False, notify=False)`는 로컬 EPUB만
 생성합니다. 재시도는 같은 요청 ID, 출력 모드, 알림 설정을 유지하며 종료된 작업자도 복구합니다.
 
+운영 MCP 코드 배포는 `deploy_mcp.py`로 수행합니다. 현재 승인, 로컬·공개 EPUBCheck,
+OPDS 최신본과 구판·중복 여부를 자동 검사하고, 실패 시 단계별 보고서를 남깁니다.
+재시작 없는 점검도 지원하며, 명령과 매니페스트 요건은 위 스킬을 참조하십시오.
+
 공개 OPDS 주소: **https://books.foundby.kr/opds**. 기기로 직접 보내는 기능은 기본적으로
 꺼져 있으며, 기존 장치 연동이 필요한 경우에만 `BABELFORGE_DEVICE_PUSH=1`로 켭니다.
 기기 전송이나 알림 실패는 EPUB 생성·배포 완료를 취소하지 않습니다.

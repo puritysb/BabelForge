@@ -165,6 +165,45 @@ Unmanaged/remote write failures stop publication rather than bypassing server lo
 Do not claim success merely because a Calibre import succeeded: return the verified
 acquisition URLs only after the final publication journal says `completed`.
 
+## Deploy MCP code and verify the full published library
+
+After reviewing and merging code, use the managed deployment command instead of
+restarting the LaunchAgent alone. It does not retranslate, approve, publish or
+remove books. Use a completed review manifest covering **every published request**;
+any number of editions is supported, and Calibre IDs come from the catalog.
+
+```bash
+./venv/bin/python3 deploy_mcp.py manifest.json --expected-commit "$(git rev-parse HEAD)"
+# Inspect the running service and published books without restarting:
+./venv/bin/python3 deploy_mcp.py manifest.json --check-only
+```
+
+A real deployment requires a clean checkout and a matching installed MCP
+LaunchAgent. `BABELFORGE_MCP_LAUNCH_AGENT` can select its plist. The command holds
+deployment/publication locks, refuses active workers and unfinished Calibre
+maintenance, and blocks new MCP translation/retry claims while checking. Status
+queries remain available. It validates all current exact-text approvals and
+retained source/profile/artifact hashes before restarting, then requires a new PID
+and real MCP tool responses. Transport readiness is retried within 30 seconds;
+stale statuses and failed approvals are never retried into success.
+
+Both advertised and stable OPDS EPUB downloads must match every approved
+original/Korean pair and pass official EPUBCheck. The complete Calibre managed
+inventory and OPDS pagination must contain the expected canonical editions once,
+with no deleted-record acquisitions. The command also checks canonical EPUBs,
+summary-bound delivery copies and ZIP contents. Extra EPUB/ZIP files in the managed
+library, same-identity catalog aliases, and any remaining paths in the review
+folder's optional `old-deliverables.json` block success. Keep sources and editorial
+records outside the managed output library; unrelated Calibre books are preserved.
+
+Checks run again after downloads to catch concurrent changes. Every invocation
+writes a fresh JSON report under `data/deployments/`; `--report` can select a new
+path, but an existing report is never overwritten. A failure exits nonzero and
+records `completed=false` and its stage. A successful restart alone is not a
+successful deployment. Failed post-restart validation leaves the service running
+and the library intact for diagnosis; fix the cause, then rerun with a fresh report.
+Check-only mode may inspect an uncommitted checkout but never claims to deploy it.
+
 ## Optional legacy device delivery
 
 Direct device push is off by default. Only use `BABELFORGE_DEVICE_PUSH=1` when the user
