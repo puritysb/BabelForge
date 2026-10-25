@@ -181,6 +181,15 @@ class PublicationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory,patch.object(p,'fetch',return_value=b'<feed xmlns="http://www.w3.org/2005/Atom"/>'):
             with self.assertRaises(p.PublicationError):p.verify_public(7,[],directory)
 
+    def test_stable_url_requires_official_checker_even_when_advertised_copy_passes(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(p, 'opds_acquisitions', return_value={7: ['https://example.test/book']}), \
+                patch.object(p, 'fetch', return_value=b'EPUB'), \
+                patch.object(p, 'validate_epub', side_effect=[
+                    {'epubcheck': 'passed'}, {'epubcheck': 'not_available'}]):
+            with self.assertRaisesRegex(p.PublicationError, 'stable acquisitions'):
+                p.verify_public(7, [('source', '번역')], directory)
+
     def test_readonly_server_is_restarted_on_write_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/'test.server.plist'

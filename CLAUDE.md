@@ -47,6 +47,7 @@ instead of silently resetting the catalog or queue.
 | `publish.py` | Stable edition identifiers; replaces an existing EPUB format without deleting its Calibre record, otherwise adds a separate edition. |
 | `publication.py` | Serialized revision promotion, temporary staging, public OPDS acquisition/content/EPUBCheck verification, catalog commit and identity/hash-bound obsolete deletion. No old-edition backups. |
 | `publish_reviewed.py` | Publishes a completed review manifest only after exact final approval and artifact checks; supports a read-only preflight. |
+| `deploy_mcp.py` | Managed MCP deployment gate: current approvals, local/public EPUBCheck, complete catalog/Calibre/OPDS inventory, exact approved contents, delivery bundles, and obsolete/duplicate detection. Durable failure/success reports under `data/deployments/`. |
 | `state_store.py`, `catalog.py` | POSIX process locks, atomic state transactions, conditional retry claims and crashed-worker recovery. |
 | `babelforge_mcp.py` | Typed search, detached translation, retry and status tools. Local streamable HTTP on `127.0.0.1:8770/mcp` by default. |
 | `device_push.py`, `pending_queue.py`, `auto_push_watcher.py` | Optional legacy device integration. Disabled by default. |
@@ -206,6 +207,16 @@ The MCP LaunchAgent is `com.local.babelforge-mcp`. The legacy device watcher is
 network activity unless `BABELFORGE_DEVICE_PUSH=1`. Moving the checkout requires
 updating installed plist paths. No launchd configuration is changed automatically
 by code edits.
+
+Use the skill's `deploy_mcp.py` procedure for MCP code deployments. It requires a
+clean checkout and a complete published-edition review manifest, serializes against
+publication, blocks new MCP translation/retry claims while deploying, and refuses
+live workers or unfinished Calibre maintenance. Only a changed MCP PID, real tool
+responses, current exact-text approvals, full local/public EPUBCheck and a clean
+inventory can produce a completed deployment report. A failed post-restart check
+leaves the service running but records failure; it never approves, republishes,
+deletes books, rolls back artifacts, or weakens server write policy. Check-only mode
+does not restart the service and records the checkout fingerprint, including edits.
 
 Invoke `venv/bin/python3` directly. This venv was moved historically, so activation
 scripts/console-script shebangs may have stale paths; recreate from requirements

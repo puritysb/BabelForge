@@ -28,14 +28,30 @@ import os
 import subprocess
 import sys
 import tempfile
+from functools import wraps
+from contextlib import ExitStack
 
 from mcp.server.fastmcp import FastMCP
 
 import config
 import catalog
 import search as search_mod
+from state_store import file_lock
 
 mcp = FastMCP("babelforge")
+
+
+def _deployment_safe(function):
+    """Do not create/claim requests while deployment inspects and restarts MCP."""
+    @wraps(function)
+    def guarded(*args, **kwargs):
+        with ExitStack() as locks:
+            try:
+                locks.enter_context(file_lock(os.path.join(config.DATA_DIR, '.deployment.lock'), blocking=False))
+            except BlockingIOError:
+                return {"error": "MCP deployment verification in progress; retry later"}
+            return function(*args, **kwargs)
+    return guarded
 
 
 def _candidate_to_dict(c) -> dict:
@@ -97,6 +113,7 @@ def search_books(query: str, limit_per_source: int = 5) -> list[dict]:
 
 
 @mcp.tool()
+@_deployment_safe
 def translate_book(candidate: dict, notify: bool = True,
                    publish_output: bool = True) -> dict:
     """Create a bilingual EPUB, optionally publishing it through Calibre/OPDS.
@@ -117,6 +134,7 @@ def translate_book(candidate: dict, notify: bool = True,
 
 
 @mcp.tool()
+@_deployment_safe
 def retry_request(req_id: str, notify: bool | None = None,
                   publish_output: bool | None = None) -> dict:
     """Resume one failed translation using the same request and checkpoints.
