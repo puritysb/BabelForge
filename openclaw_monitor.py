@@ -212,7 +212,8 @@ def run(settings, *, checker=None, notifier=None, report_dir=None):
     log_path = runtime/f'{run_id}.log'
     state_path = runtime/'incident.json'
     with file_lock(str(runtime/'monitor.lock'), blocking=False):
-        record = {'report': str(report_path), 'log': str(log_path), 'completed': False}
+        record = {'report': str(report_path), 'log': str(log_path), 'completed': False,
+                  'started_at': datetime.now().astimezone().isoformat()}
         report = {}
         error = None
         try:
@@ -227,8 +228,11 @@ def run(settings, *, checker=None, notifier=None, report_dir=None):
         except Exception as exc:
             error = f'{type(exc).__name__}: {exc}'
             record['error'] = error  # local record only
+            record['error_stage'] = report.get('stage', 'monitor')
+            record['incident_fingerprint'] = incident(error, record['error_stage'], settings['expected'])
             record['notification'] = notifier(settings, error, report.get('stage', 'monitor'),
                                              report_path, log_path, state_path)
+        record['finished_at'] = datetime.now().astimezone().isoformat()
         save(runtime/f'{run_id}.json', record)
         save(runtime/'latest.json', record)
         print('NO_REPLY' if not error else f'Monitor failed; report={report_path}; log={log_path}')

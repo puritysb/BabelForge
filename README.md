@@ -64,6 +64,9 @@ OpenClaw 정기 점검은 저장소의 `openclaw_monitor.py`를 실행합니다.
 재설치와 기준 갱신 절차도 위 스킬에서 관리합니다.
 `openclaw_line_drill.py`는 운영 상태와 분리된 LINE 알림 시험을 제공합니다. 기본은 미리보기이며,
 명시적 시험 실행에서 최초 1회 전송·중복 억제·무알림 복구와 기존 일정 유지를 검증합니다.
+`install_openclaw_followup.py`는 특정 날짜의 실제 예약 실행을 확인하는 일회성 후속 점검을
+설정합니다. `openclaw_followup.py`가 실행 기록과 검증 보고서를 연결하고, 정상은 무알림으로
+처리하며 이미 통지한 동일 이상은 다시 보내지 않습니다. 설정·사용 절차는 위 스킬을 따릅니다.
 
 공개 OPDS 주소: **https://books.foundby.kr/opds**. 기기로 직접 보내는 기능은 기본적으로
 꺼져 있으며, 기존 장치 연동이 필요한 경우에만 `BABELFORGE_DEVICE_PUSH=1`로 켭니다.
